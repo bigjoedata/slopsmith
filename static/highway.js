@@ -1,0 +1,955 @@
+/**
+ * Canvas-based Rocksmith highway renderer.
+ * Receives note data via WebSocket, renders on requestAnimationFrame.
+ */
+const highway = (() => {
+    let canvas, ctx, ws;
+    let currentTime = 0;
+    let animFrame = null;
+
+    // Song data (populated via WebSocket)
+    let songInfo = {};
+    let notes = [];
+    let chords = [];
+    let beats = [];
+    let sections = [];
+    let anchors = [];
+    let chordTemplates = [];
+    let lyrics = [];
+    let ready = false;
+    let showLyrics = true;
+
+    // Rendering config
+    const VISIBLE_SECONDS = 3.0;
+    const Z_CAM = 2.2;
+    const Z_MAX = 10.0;
+    const BG = '#080810';
+
+    const STRING_COLORS = [
+        '#cc0000', '#cca800', '#0066cc',
+        '#cc6600', '#00cc66', '#9900cc',
+    ];
+    const STRING_DIM = [
+        '#520000', '#524200', '#002952',
+        '#522900', '#005229', '#3d0052',
+    ];
+    const STRING_BRIGHT = [
+        '#ff3c3c', '#ffe040', '#3c9cff',
+        '#ff9c3c', '#3cff9c', '#cc3cff',
+    ];
+
+    // ── Projection ───────────────────────────────────────────────────────
+    function project(tOffset) {
+        if (tOffset > VISIBLE_SECONDS || tOffset < -0.05) return null;
+        if (tOffset < 0) return { y: 0.82 + Math.abs(tOffset) * 0.3, scale: 1.0 };
+
+        const z = tOffset * (Z_MAX / VISIBLE_SECONDS);
+        const denom = z + Z_CAM;
+        if (denom < 0.01) return null;
+        const scale = Z_CAM / denom;
+        const y = 0.82 + (0.08 - 0.82) * (1.0 - scale);
+        return { y, scale };
+    }
+
+    // ── Anchor / Fret mapping ────────────────────────────────────────────
+    // Zoom approach: fret 0 is always at the left edge, fret N at the right.
+    // The "zoom level" determines how many frets are visible.
+    // When playing low frets, zoom in (fewer frets visible, bigger notes).
+    // When playing high frets, zoom out (more frets visible, smaller spacing).
+    let displayMaxFret = 12;  // rightmost visible fret (smoothed)
+
+    function getAnchorAt(t) {
+        let a = anchors[0] || { fret: 1, width: 4 };
+        for (const anc of anchors) {
+            if (anc.time > t) break;
+            a = anc;
+        }
+        return a;
+    }
+
+    function getMaxFretInWindow(t) {
+        // Find the highest fret needed across all anchors visible on screen
+        let maxFret = 0;
+        for (const anc of anchors) {
+            if (anc.time > t + VISIBLE_SECONDS) break;
+            if (anc.time + 2 < t) continue;  // skip anchors well in the past
+            const top = anc.fret + anc.width;
+            if (top > maxFret) maxFret = top;
+        }
+        return maxFret;
+    }
+
+    function updateSmoothAnchor(anchor, dt) {
+        const rate = Math.min(1.0 * dt, 1.0);
+        // Look ahead: use the widest fret range across all visible anchors
+        const lookAheadMax = getMaxFretInWindow(currentTime);
+        const currentMax = anchor.fret + anchor.width;
+        const needed = Math.max(currentMax, lookAheadMax);
+        const targetMax = Math.max(needed + 3, 8);
+        displayMaxFret += (targetMax - displayMaxFret) * rate;
+    }
+
+    function fretX(fret, scale, w) {
+        const hw = w * 0.52 * scale;
+        const margin = hw * 0.06;
+        const usable = hw * 2 - 2 * margin;
+        // Fret 0 at left, displayMaxFret at right
+        const t = fret / Math.max(1, displayMaxFret);
+        return w / 2 - hw + margin + t * usable;
+    }
+
+    // ── Drawing ──────────────────────────────────────────────────────────
+    let _drawCount = 0;
+    function draw() {
+        animFrame = requestAnimationFrame(draw);
+        if (!canvas || !ready) return;
+        try {
+        const W = canvas.width;
+        const H = canvas.height;
+        if (_drawCount++ < 3) console.log(`draw: W=${W} H=${H} t=${currentTime.toFixed(2)} notes=${notes.length}`);
+        ctx.fillStyle = BG;
+        ctx.fillRect(0, 0, W, H);
+
+        const anchor = getAnchorAt(currentTime);
+        updateSmoothAnchor(anchor, 1 / 60);
+
+        drawHighway(W, H);
+        drawFretLines(W, H);
+        drawBeats(W, H);
+        drawStrings(W, H);
+        drawSustains(W, H);
+        drawNowLine(W, H);
+        drawNotes(W, H);
+        drawChords(W, H);
+        drawFretNumbers(W, H);
+        if (showLyrics) drawLyrics(W, H);
+
+        } catch (e) {
+            console.error('draw error:', e);
+        }
+    }
+
+    function drawHighway(W, H) {
+        const strips = 40;
+        for (let i = 0; i < strips; i++) {
+            const t0 = (i / strips) * VISIBLE_SECONDS;
+            const t1 = ((i + 1) / strips) * VISIBLE_SECONDS;
+            const p0 = project(t0), p1 = project(t1);
+            if (!p0 || !p1) continue;
+
+            const hw0 = W * 0.26 * p0.scale;
+            const hw1 = W * 0.26 * p1.scale;
+            const bright = 18 + 10 * p0.scale;
+
+            ctx.fillStyle = `rgb(${bright|0},${bright|0},${(bright+14)|0})`;
+            ctx.beginPath();
+            ctx.moveTo(W/2 - hw0, p0.y * H);
+            ctx.lineTo(W/2 + hw0, p0.y * H);
+            ctx.lineTo(W/2 + hw1, p1.y * H);
+            ctx.lineTo(W/2 - hw1, p1.y * H);
+            ctx.fill();
+        }
+    }
+
+    function drawFretLines(W, H) {
+        const pad = 3;
+        const lo = 0;
+        const hi = Math.ceil(displayMaxFret);
+        ctx.strokeStyle = '#2d2d45';
+        ctx.lineWidth = 1;
+
+        for (let fret = lo; fret <= hi; fret++) {
+            if (fret < 0) continue;
+            ctx.beginPath();
+            for (let i = 0; i <= 40; i++) {
+                const t = (i / 40) * VISIBLE_SECONDS;
+                const p = project(t);
+                if (!p) continue;
+                const x = fretX(fret, p.scale, W);
+                if (i === 0) ctx.moveTo(x, p.y * H);
+                else ctx.lineTo(x, p.y * H);
+            }
+            ctx.stroke();
+        }
+    }
+
+    function drawBeats(W, H) {
+        for (const beat of beats) {
+            const tOff = beat.time - currentTime;
+            const p = project(tOff);
+            if (!p || p.scale < 0.06) continue;
+            const hw = W * 0.26 * p.scale;
+            const isMeasure = beat.measure >= 0;
+            ctx.strokeStyle = isMeasure ? '#343450' : '#202038';
+            ctx.lineWidth = isMeasure ? 2 : 1;
+            ctx.beginPath();
+            ctx.moveTo(W/2 - hw, p.y * H);
+            ctx.lineTo(W/2 + hw, p.y * H);
+            ctx.stroke();
+        }
+    }
+
+    function drawStrings(W, H) {
+        const strTop = H * 0.83;
+        const strBot = H * 0.95;
+        const margin = W * 0.03;
+        for (let i = 0; i < 6; i++) {
+            const y = strBot - (i / 5) * (strBot - strTop);
+            ctx.strokeStyle = STRING_COLORS[i];
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.moveTo(margin, y);
+            ctx.lineTo(W - margin, y);
+            ctx.stroke();
+        }
+    }
+
+    function drawNowLine(W, H) {
+        const y = H * 0.82;
+        const hw = W * 0.26;
+        // Glow
+        for (let i = 1; i < 5; i++) {
+            const a = Math.max(0, 70 - i * 15);
+            ctx.strokeStyle = `rgba(${a},${a},${a+8},1)`;
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(W/2 - hw, y - i);
+            ctx.lineTo(W/2 + hw, y - i);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(W/2 - hw, y + i);
+            ctx.lineTo(W/2 + hw, y + i);
+            ctx.stroke();
+        }
+        ctx.strokeStyle = '#dce0f0';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(W/2 - hw, y);
+        ctx.lineTo(W/2 + hw, y);
+        ctx.stroke();
+    }
+
+    function drawNote(W, H, x, y, scale, string, fret, opts) {
+        const isHarmonic = opts?.hm || opts?.hp || false;
+        const isPinchHarmonic = opts?.hp || false;
+        const isChord = opts?.chord || false;
+        const bend = opts?.bn || 0;
+        const slide = opts?.sl || -1;
+        const hammerOn = opts?.ho || false;
+        const pullOff = opts?.po || false;
+        const tap = opts?.tp || false;
+        const palmMute = opts?.pm || false;
+        const tremolo = opts?.tr || false;
+        const accent = opts?.ac || false;
+        const sz = Math.max(12, 80 * scale * (H / 900));
+        const half = sz / 2;
+        const color = STRING_COLORS[string] || '#888';
+        const dark = STRING_DIM[string] || '#222';
+
+        if (sz < 6) {
+            ctx.fillStyle = color;
+            ctx.beginPath();
+            ctx.arc(x, y, 2, 0, Math.PI * 2);
+            ctx.fill();
+            return;
+        }
+
+        // Open string: wide bar spanning the highway (only for standalone notes)
+        if (fret === 0 && !isChord) {
+            const hw = W * 0.26 * scale;
+            const barH = Math.max(6, sz * 0.45);
+            // Shadow
+            ctx.fillStyle = dark;
+            roundRect(ctx, W/2 - hw - 1, y - barH/2 - 1, hw * 2 + 2, barH + 2, 3);
+            ctx.fill();
+            // Body
+            ctx.fillStyle = color;
+            roundRect(ctx, W/2 - hw, y - barH/2, hw * 2, barH, 2);
+            ctx.fill();
+            // "0" label
+            const fontSize = Math.max(8, sz * 0.5) | 0;
+            ctx.fillStyle = '#fff';
+            ctx.font = `bold ${fontSize}px sans-serif`;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText('0', W/2, y);
+            return;
+        }
+
+        if (isHarmonic) {
+            // Diamond shape for harmonics
+            const dh = half * 1.15;
+            // Glow
+            ctx.fillStyle = dark;
+            ctx.beginPath();
+            ctx.moveTo(x, y - dh - 3); ctx.lineTo(x + half + 3, y);
+            ctx.lineTo(x, y + dh + 3); ctx.lineTo(x - half - 3, y);
+            ctx.closePath(); ctx.fill();
+            // Body
+            ctx.fillStyle = color;
+            ctx.beginPath();
+            ctx.moveTo(x, y - dh); ctx.lineTo(x + half, y);
+            ctx.lineTo(x, y + dh); ctx.lineTo(x - half, y);
+            ctx.closePath(); ctx.fill();
+            // Bright outline
+            ctx.strokeStyle = STRING_BRIGHT[string] || '#fff';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(x, y - dh); ctx.lineTo(x + half, y);
+            ctx.lineTo(x, y + dh); ctx.lineTo(x - half, y);
+            ctx.closePath(); ctx.stroke();
+            // PH label for pinch harmonics
+            if (isPinchHarmonic && sz >= 14) {
+                ctx.fillStyle = '#ff0';
+                ctx.font = `bold ${Math.max(8, sz * 0.25) | 0}px sans-serif`;
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'top';
+                ctx.fillText('PH', x, y + dh + 2);
+            }
+        } else {
+            // Glow
+            ctx.fillStyle = dark;
+            roundRect(ctx, x - half - 4, y - half - 4, sz + 8, sz + 8, sz / 3);
+            ctx.fill();
+            // Body
+            ctx.fillStyle = color;
+            roundRect(ctx, x - half, y - half, sz, sz, sz / 5);
+            ctx.fill();
+        }
+
+        // Fret number
+        const fontSize = Math.max(10, sz * 0.5) | 0;
+        ctx.fillStyle = '#fff';
+        ctx.font = `bold ${fontSize}px sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(String(fret), x, y);
+
+        // Bend notation
+        if (bend && bend > 0 && sz >= 12) {
+            const lw = Math.max(2, sz / 10);
+            const arrowH = sz * 0.55 * Math.min(bend, 2);  // taller for bigger bends
+            const ay = y - half - 4;
+            const tipY = ay - arrowH;
+
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = lw;
+
+            // Curved arrow
+            ctx.beginPath();
+            ctx.moveTo(x, ay);
+            ctx.quadraticCurveTo(x + sz * 0.2, ay - arrowH * 0.5, x, tipY);
+            ctx.stroke();
+
+            // Arrowhead
+            ctx.beginPath();
+            ctx.moveTo(x - sz * 0.12, tipY + sz * 0.12);
+            ctx.lineTo(x, tipY);
+            ctx.lineTo(x + sz * 0.12, tipY + sz * 0.12);
+            ctx.stroke();
+
+            // Bend label: "full", "1/2", "1 1/2", "2"
+            let label;
+            if (bend === 0.5) label = '½';
+            else if (bend === 1) label = 'full';
+            else if (bend === 1.5) label = '1½';
+            else if (bend === 2) label = '2';
+            else label = bend.toFixed(1);
+
+            ctx.fillStyle = '#fff';
+            ctx.font = `bold ${Math.max(9, sz * 0.28) | 0}px sans-serif`;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'bottom';
+            ctx.fillText(label, x, tipY - 2);
+        }
+
+        if (sz < 14) return;  // Skip small technique labels
+
+        // Slide indicator (diagonal arrow)
+        if (slide >= 0) {
+            const dir = slide > fret ? -1 : 1;  // arrow direction (up or down the neck)
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = Math.max(2, sz / 10);
+            ctx.beginPath();
+            ctx.moveTo(x - sz * 0.3, y + dir * sz * 0.3);
+            ctx.lineTo(x + sz * 0.3, y - dir * sz * 0.3);
+            ctx.stroke();
+            // Arrowhead
+            ctx.beginPath();
+            ctx.moveTo(x + sz * 0.3, y - dir * sz * 0.3);
+            ctx.lineTo(x + sz * 0.15, y - dir * sz * 0.15);
+            ctx.stroke();
+        }
+
+        // H/P/T label above note
+        if (hammerOn || pullOff || tap) {
+            const label = tap ? 'T' : (hammerOn ? 'H' : 'P');
+            const ly = y - half - (bend > 0 ? sz * 0.6 : 4);
+            ctx.fillStyle = '#fff';
+            ctx.font = `bold ${Math.max(9, sz * 0.3) | 0}px sans-serif`;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'bottom';
+            ctx.fillText(label, x, ly);
+        }
+
+        // Palm mute (PM below note)
+        if (palmMute) {
+            ctx.fillStyle = '#aaa';
+            ctx.font = `bold ${Math.max(8, sz * 0.25) | 0}px sans-serif`;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'top';
+            ctx.fillText('PM', x, y + half + 2);
+        }
+
+        // Tremolo (wavy line above)
+        if (tremolo) {
+            const ty = y - half - (bend > 0 ? sz * 0.7 : 6);
+            ctx.strokeStyle = '#ff0';
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            for (let i = -3; i <= 3; i++) {
+                const wx = x + i * sz * 0.08;
+                const wy = ty + Math.sin(i * 2) * 3;
+                if (i === -3) ctx.moveTo(wx, wy);
+                else ctx.lineTo(wx, wy);
+            }
+            ctx.stroke();
+        }
+
+        // Accent (> marker)
+        if (accent) {
+            const ay2 = y - half - 4;
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(x - sz * 0.2, ay2 + 3);
+            ctx.lineTo(x, ay2 - 2);
+            ctx.lineTo(x + sz * 0.2, ay2 + 3);
+            ctx.stroke();
+        }
+    }
+
+    function drawSustains(W, H) {
+        for (const n of notes) {
+            if (n.sus <= 0.01) continue;
+            const end = n.t + n.sus;
+            if (end < currentTime || n.t > currentTime + VISIBLE_SECONDS) continue;
+
+            const t0 = Math.max(n.t - currentTime, 0);
+            const t1 = Math.min(end - currentTime, VISIBLE_SECONDS);
+            if (t0 >= t1) continue;
+
+            const p0 = project(t0), p1 = project(t1);
+            if (!p0 || !p1) continue;
+
+            const x0 = fretX(n.f, p0.scale, W);
+            const x1 = fretX(n.f, p1.scale, W);
+            const sw0 = Math.max(2, 6 * p0.scale);
+            const sw1 = Math.max(2, 6 * p1.scale);
+
+            ctx.fillStyle = STRING_DIM[n.s] || '#333';
+            ctx.beginPath();
+            ctx.moveTo(x0 - sw0, p0.y * H);
+            ctx.lineTo(x0 + sw0, p0.y * H);
+            ctx.lineTo(x1 + sw1, p1.y * H);
+            ctx.lineTo(x1 - sw1, p1.y * H);
+            ctx.fill();
+        }
+    }
+
+    function drawNotes(W, H) {
+        // Binary search for visible range
+        const tMin = currentTime - 0.25;
+        const tMax = currentTime + VISIBLE_SECONDS;
+        let lo = bsearch(notes, tMin);
+        let hi = bsearch(notes, tMax);
+
+        // Include sustained notes
+        while (lo > 0 && notes[lo-1].t + notes[lo-1].sus > currentTime) lo--;
+
+        // Collect drawn positions for unison bend detection
+        const drawnNotes = [];
+
+        for (let i = hi - 1; i >= lo; i--) {
+            const n = notes[i];
+            let tOff = n.t - currentTime;
+
+            // Hold sustained notes at now line
+            let p;
+            if (tOff < -0.05 && n.sus > 0 && n.t + n.sus > currentTime) {
+                p = { y: 0.82, scale: 1.0 };
+            } else {
+                p = project(tOff);
+            }
+            if (!p) continue;
+
+            const x = fretX(n.f, p.scale, W);
+            drawNote(W, H, x, p.y * H, p.scale, n.s, n.f, n);
+            drawnNotes.push({ t: n.t, s: n.s, f: n.f, bn: n.bn || 0, x, y: p.y * H, scale: p.scale });
+        }
+
+        // Draw unison bend connectors
+        drawUnisonBends(W, H, drawnNotes);
+    }
+
+    function drawUnisonBends(W, H, drawnNotes) {
+        // Group notes by time (within 0.01s tolerance)
+        const groups = [];
+        const used = new Set();
+        for (let i = 0; i < drawnNotes.length; i++) {
+            if (used.has(i)) continue;
+            const group = [drawnNotes[i]];
+            used.add(i);
+            for (let j = i + 1; j < drawnNotes.length; j++) {
+                if (used.has(j)) continue;
+                if (Math.abs(drawnNotes[j].t - drawnNotes[i].t) < 0.01) {
+                    group.push(drawnNotes[j]);
+                    used.add(j);
+                }
+            }
+            if (group.length >= 2) groups.push(group);
+        }
+
+        for (const group of groups) {
+            // Find pairs: one with bend, one without (or both with different bends)
+            const bent = group.filter(n => n.bn > 0);
+            const unbent = group.filter(n => n.bn === 0);
+            if (bent.length === 0 || unbent.length === 0) continue;
+
+            // Draw connector between each bent-unbent pair
+            for (const bn of bent) {
+                // Find the closest unbent note by string
+                let closest = unbent[0];
+                for (const ub of unbent) {
+                    if (Math.abs(ub.s - bn.s) < Math.abs(closest.s - bn.s)) closest = ub;
+                }
+
+                const sz = Math.max(12, 80 * bn.scale * (H / 900));
+                if (sz < 14) continue;
+
+                // Draw a curved dashed line connecting bent note to target note
+                const x1 = bn.x, y1 = bn.y;
+                const x2 = closest.x, y2 = closest.y;
+                const midX = (x1 + x2) / 2 + sz * 0.5;
+                const midY = (y1 + y2) / 2;
+
+                ctx.save();
+                ctx.strokeStyle = '#60d0ff';
+                ctx.lineWidth = Math.max(2, sz / 12);
+                ctx.setLineDash([4, 4]);
+                ctx.beginPath();
+                ctx.moveTo(x1, y1);
+                ctx.quadraticCurveTo(midX, midY, x2, y2);
+                ctx.stroke();
+                ctx.setLineDash([]);
+                ctx.restore();
+
+                // "U" label at midpoint
+                const labelSz = Math.max(10, sz * 0.3) | 0;
+                ctx.fillStyle = '#60d0ff';
+                ctx.font = `bold ${labelSz}px sans-serif`;
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                const cpX = (x1 + 2 * midX + x2) / 4;
+                const cpY = (y1 + 2 * midY + y2) / 4;
+                ctx.fillText('U', cpX + sz * 0.3, cpY);
+            }
+        }
+    }
+
+    function drawChords(W, H) {
+        const tMin = currentTime - 0.25;
+        const tMax = currentTime + VISIBLE_SECONDS;
+        let lo = bsearchChords(chords, tMin);
+        let hi = bsearchChords(chords, tMax);
+
+        for (let i = hi - 1; i >= lo; i--) {
+            const ch = chords[i];
+            const p = project(ch.t - currentTime);
+            if (!p) continue;
+
+            const sorted = [...ch.notes].sort((a, b) => a.s - b.s);
+            const sz = Math.max(10, 28 * p.scale * (H / 900));
+            const spread = sz * 0.85;
+            const totalH = spread * (sorted.length - 1);
+
+            // Bracket connector
+            const minSpread = sz + 16;  // full note size + gap (accounts for glow)
+            const actualSpread = Math.max(spread, minSpread);
+            const actualTotalH = actualSpread * (sorted.length - 1);
+            if (sorted.length >= 2) {
+                const positions = sorted.map((cn, j) => ({
+                    x: fretX(cn.f, p.scale, W),
+                    y: p.y * H - actualTotalH / 2 + j * actualSpread,
+                }));
+                const barY = positions[0].y - sz * 0.7;
+
+                ctx.fillStyle = '#50a0dc';
+                ctx.lineWidth = Math.max(3, sz / 4);
+                // Horizontal bar
+                const xMin = Math.min(...positions.map(p => p.x));
+                const xMax = Math.max(...positions.map(p => p.x));
+                roundRect(ctx, xMin - 2, barY - 2, xMax - xMin + 4, 4, 2);
+                ctx.fill();
+                // Stems
+                for (const pos of positions) {
+                    ctx.fillRect(pos.x - 2, barY, 4, pos.y - sz/2 - barY);
+                }
+            }
+
+            // Chord name label
+            if (!ch.hd && p.scale > 0.15) {
+                const tmpl = chordTemplates[ch.id];
+                if (tmpl && tmpl.name) {
+                    const labelY = (sorted.length >= 2)
+                        ? (p.y * H - actualTotalH / 2 - sz * 0.7 - sz * 0.4)
+                        : (p.y * H - sz * 0.8);
+                    const labelX = (sorted.length >= 2)
+                        ? (Math.min(...sorted.map(cn => fretX(cn.f, p.scale, W))) + Math.max(...sorted.map(cn => fretX(cn.f, p.scale, W)))) / 2
+                        : fretX(sorted[0].f, p.scale, W);
+                    ctx.fillStyle = '#fff';
+                    ctx.font = `bold ${Math.max(14, sz * 0.45) | 0}px sans-serif`;
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'bottom';
+                    ctx.fillText(tmpl.name, labelX, labelY);
+                }
+            }
+
+            // Notes — ensure same-fret notes don't overlap vertically
+            const chordPositions = [];
+            sorted.forEach((cn, j) => {
+                const x = fretX(cn.f, p.scale, W);
+                const ny = p.y * H - actualTotalH / 2 + j * actualSpread;
+                drawNote(W, H, x, ny, p.scale, cn.s, cn.f, { ...cn, chord: true });
+                chordPositions.push({ s: cn.s, f: cn.f, bn: cn.bn || 0, x, y: ny, scale: p.scale });
+            });
+
+            // Unison bend within chord
+            const bent = chordPositions.filter(n => n.bn > 0);
+            const unbent = chordPositions.filter(n => n.bn === 0);
+            if (bent.length > 0 && unbent.length > 0 && sz >= 14) {
+                for (const bn of bent) {
+                    let closest = unbent[0];
+                    for (const ub of unbent) {
+                        if (Math.abs(ub.s - bn.s) < Math.abs(closest.s - bn.s)) closest = ub;
+                    }
+                    const x1 = bn.x, y1 = bn.y;
+                    const x2 = closest.x, y2 = closest.y;
+                    const midX = (x1 + x2) / 2 + sz * 0.5;
+                    const midY = (y1 + y2) / 2;
+
+                    ctx.save();
+                    ctx.strokeStyle = '#60d0ff';
+                    ctx.lineWidth = Math.max(2, sz / 12);
+                    ctx.setLineDash([4, 4]);
+                    ctx.beginPath();
+                    ctx.moveTo(x1, y1);
+                    ctx.quadraticCurveTo(midX, midY, x2, y2);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+                    ctx.restore();
+
+                    const labelSz = Math.max(10, sz * 0.3) | 0;
+                    ctx.fillStyle = '#60d0ff';
+                    ctx.font = `bold ${labelSz}px sans-serif`;
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    const cpX = (x1 + 2 * midX + x2) / 4;
+                    const cpY = (y1 + 2 * midY + y2) / 4;
+                    ctx.fillText('U', cpX + sz * 0.3, cpY);
+                }
+            }
+        }
+    }
+
+    function drawFretNumbers(W, H) {
+        const y = H * 0.97;
+        const pad = 3;
+        const lo = 0;
+        const hi = Math.ceil(displayMaxFret);
+        const anchor = getAnchorAt(currentTime);
+
+        ctx.font = 'bold 20px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+
+        for (let fret = lo; fret <= hi; fret++) {
+            if (fret < 0) continue;
+            const x = fretX(fret, 1.0, W);
+            const inAnchor = fret >= anchor.fret && fret <= anchor.fret + anchor.width;
+            ctx.fillStyle = inAnchor ? '#e8c040' : '#8a6830';
+            ctx.fillText(String(fret), x, y);
+        }
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────
+    function drawLyrics(W, H) {
+        if (!lyrics.length) return;
+
+        const fontSize = Math.max(18, H * 0.028) | 0;
+        const lineY = H * 0.04;
+
+        // Find phrases: groups of words separated by gaps > 2s or "+" endings
+        // Pre-build phrases once (cache)
+        if (!lyrics._phrases) {
+            lyrics._phrases = [];
+            let phrase = [];
+            for (let i = 0; i < lyrics.length; i++) {
+                const l = lyrics[i];
+                if (phrase.length > 0) {
+                    const prev = phrase[phrase.length - 1];
+                    const gap = l.t - (prev.t + prev.d);
+                    if (gap > 2.0) {
+                        lyrics._phrases.push(phrase);
+                        phrase = [];
+                    }
+                }
+                phrase.push(l);
+            }
+            if (phrase.length) lyrics._phrases.push(phrase);
+        }
+
+        // Find the current phrase
+        let currentPhrase = null;
+        for (const p of lyrics._phrases) {
+            const start = p[0].t;
+            const end = p[p.length - 1].t + p[p.length - 1].d;
+            if (currentTime >= start - 0.5 && currentTime <= end + 1.0) {
+                currentPhrase = p;
+                break;
+            }
+        }
+
+        if (!currentPhrase) return;
+
+        // Split phrase into rows that fit within maxWidth
+        const maxWidth = W * 0.8;
+        ctx.font = `bold ${fontSize}px sans-serif`;
+
+        const rows = [];
+        let currentRow = [];
+        let currentRowWidth = 0;
+
+        for (let i = 0; i < currentPhrase.length; i++) {
+            const word = currentPhrase[i].w.replace(/\+$/, '') + ' ';
+            const wordWidth = ctx.measureText(word).width;
+
+            if (currentRow.length > 0 && currentRowWidth + wordWidth > maxWidth) {
+                rows.push(currentRow);
+                currentRow = [];
+                currentRowWidth = 0;
+            }
+            currentRow.push({ lyric: currentPhrase[i], text: word, width: wordWidth });
+            currentRowWidth += wordWidth;
+        }
+        if (currentRow.length) rows.push(currentRow);
+
+        // Draw background
+        const rowHeight = fontSize + 6;
+        const totalHeight = rows.length * rowHeight + 10;
+        let bgWidth = 0;
+        for (const row of rows) {
+            const rw = row.reduce((s, w) => s + w.width, 0);
+            if (rw > bgWidth) bgWidth = rw;
+        }
+        bgWidth = Math.min(bgWidth + 30, W * 0.85);
+
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        roundRect(ctx, W/2 - bgWidth/2, lineY - 4, bgWidth, totalHeight, 8);
+        ctx.fill();
+
+        // Draw each row
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'top';
+
+        for (let r = 0; r < rows.length; r++) {
+            const row = rows[r];
+            const rowWidth = row.reduce((s, w) => s + w.width, 0);
+            let xPos = W/2 - rowWidth/2;
+            const yPos = lineY + r * rowHeight + 2;
+
+            for (const w of row) {
+                const l = w.lyric;
+                const isActive = currentTime >= l.t && currentTime < l.t + l.d;
+                const isPast = currentTime >= l.t + l.d;
+
+                if (isActive) {
+                    ctx.fillStyle = '#4ae0ff';
+                    ctx.font = `bold ${fontSize}px sans-serif`;
+                } else if (isPast) {
+                    ctx.fillStyle = '#8899aa';
+                    ctx.font = `normal ${fontSize}px sans-serif`;
+                } else {
+                    ctx.fillStyle = '#556677';
+                    ctx.font = `normal ${fontSize}px sans-serif`;
+                }
+
+                ctx.fillText(w.text, xPos, yPos);
+                xPos += w.width;
+            }
+        }
+    }
+
+    function roundRect(ctx, x, y, w, h, r) {
+        ctx.beginPath();
+        ctx.moveTo(x + r, y);
+        ctx.lineTo(x + w - r, y);
+        ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+        ctx.lineTo(x + w, y + h - r);
+        ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+        ctx.lineTo(x + r, y + h);
+        ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+        ctx.lineTo(x, y + r);
+        ctx.quadraticCurveTo(x, y, x + r, y);
+        ctx.closePath();
+    }
+
+    function bsearch(arr, time) {
+        let lo = 0, hi = arr.length;
+        while (lo < hi) {
+            const mid = (lo + hi) >> 1;
+            if (arr[mid].t < time) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
+    }
+    function bsearchChords(arr, time) {
+        let lo = 0, hi = arr.length;
+        while (lo < hi) {
+            const mid = (lo + hi) >> 1;
+            if (arr[mid].t < time) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
+    }
+
+    // ── Public API ───────────────────────────────────────────────────────
+    return {
+        init(canvasEl) {
+            canvas = canvasEl;
+            ctx = canvas.getContext('2d');
+            this.resize();
+            window.addEventListener('resize', () => this.resize());
+            ready = false;
+            notes = []; chords = []; beats = []; sections = []; anchors = []; lyrics = [];
+        },
+
+        resize() {
+            if (!canvas) return;
+            const controls = document.getElementById('player-controls');
+            const controlsH = controls ? controls.offsetHeight : 50;
+            canvas.width = document.documentElement.clientWidth;
+            canvas.height = document.documentElement.clientHeight - controlsH;
+        },
+
+        connect(wsUrl) {
+            ws = new WebSocket(wsUrl);
+            ws.onclose = () => { console.log('WS closed'); };
+            ws.onerror = (e) => { console.error('WS error', e); };
+            ws.onmessage = (ev) => {
+                const msg = JSON.parse(ev.data);
+                if (msg.error) {
+                    console.error('Server error:', msg.error);
+                    alert('Error: ' + msg.error);
+                    return;
+                }
+                switch (msg.type) {
+                    case 'song_info':
+                        songInfo = msg;
+                        document.getElementById('hud-artist').textContent = msg.artist;
+                        document.getElementById('hud-title').textContent = msg.title;
+                        document.getElementById('hud-arrangement').textContent = msg.arrangement;
+                        if (msg.audio_url) {
+                            const audio = document.getElementById('audio');
+                            // Only reload audio if it's a different song
+                            if (!audio.src || !audio.src.includes(msg.audio_url.split('/').pop())) {
+                                audio.src = msg.audio_url;
+                                audio.load();
+                            }
+                        }
+                        // Populate arrangement dropdown
+                        if (msg.arrangements) {
+                            const sel = document.getElementById('arr-select');
+                            sel.innerHTML = msg.arrangements.map(a =>
+                                `<option value="${a.index}" ${a.index === msg.arrangement_index ? 'selected' : ''}>${a.name} (${a.notes})</option>`
+                            ).join('');
+                        }
+                        break;
+                    case 'beats': beats = msg.data; break;
+                    case 'sections': sections = msg.data; break;
+                    case 'anchors':
+                        anchors = msg.data;
+                        if (anchors.length) {
+                            displayMaxFret = Math.max(anchors[0].fret + anchors[0].width + 3, 8);
+                        }
+                        break;
+                    case 'chord_templates': chordTemplates = msg.data; break;
+                    case 'lyrics': lyrics = msg.data; break;
+                    case 'notes': notes = notes.concat(msg.data); break;
+                    case 'chords': chords = chords.concat(msg.data); break;
+                    case 'ready':
+                        ready = true;
+                        console.log(`Highway ready: ${notes.length} notes, ${chords.length} chords`);
+                        if (!animFrame) draw();
+                        if (highway._onReady) highway._onReady();
+                        break;
+                }
+            };
+        },
+
+        setTime(t) { currentTime = t; },
+
+        getBPM(t) {
+            // Calculate BPM from beat intervals near time t
+            if (beats.length < 2) return 120;
+            let closest = 0;
+            for (let i = 1; i < beats.length; i++) {
+                if (Math.abs(beats[i].time - t) < Math.abs(beats[closest].time - t)) closest = i;
+            }
+            // Average interval from nearby beats
+            const start = Math.max(0, closest - 2);
+            const end = Math.min(beats.length - 1, closest + 2);
+            let sum = 0, count = 0;
+            for (let i = start; i < end; i++) {
+                sum += beats[i + 1].time - beats[i].time;
+                count++;
+            }
+            return count > 0 ? 60 / (sum / count) : 120;
+        },
+
+        toggleLyrics() {
+            showLyrics = !showLyrics;
+            const btn = document.getElementById('btn-lyrics');
+            if (btn) {
+                btn.textContent = showLyrics ? 'Lyrics ✓' : 'Lyrics ✗';
+                btn.className = showLyrics
+                    ? 'px-3 py-1.5 bg-purple-900/40 hover:bg-purple-900/60 rounded-lg text-xs text-purple-300 transition'
+                    : 'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-500 transition';
+            }
+        },
+
+        reconnect(filename, arrangement) {
+            // Close old WS but keep audio + animation running
+            if (ws) { ws.close(); ws = null; }
+            ready = false;
+            notes = []; chords = []; beats = []; sections = []; anchors = []; lyrics = [];
+            const arrParam = arrangement !== undefined ? `?arrangement=${arrangement}` : '';
+            // filename might already be encoded from data-play attribute
+            const decoded = decodeURIComponent(filename);
+            const wsUrl = `ws://${location.host}/ws/highway/${decoded}${arrParam}`;
+            console.log('reconnect:', wsUrl);
+            this.connect(wsUrl);
+        },
+
+        stop() {
+            if (animFrame) { cancelAnimationFrame(animFrame); animFrame = null; }
+            if (ws) { ws.close(); ws = null; }
+            ready = false;
+            const audio = document.getElementById('audio');
+            audio.pause();
+            audio.src = '';
+            isPlaying = false;
+            document.getElementById('btn-play').textContent = '▶ Play';
+        },
+    };
+})();

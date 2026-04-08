@@ -1006,7 +1006,7 @@ const highway = (() => {
             const arrParam = arrangement !== undefined ? `?arrangement=${arrangement}` : '';
             // filename might already be encoded from data-play attribute
             const decoded = decodeURIComponent(filename);
-            const wsUrl = `ws://${location.host}/ws/highway/${decoded}${arrParam}`;
+            const wsUrl = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws/highway/${decoded}${arrParam}`;
             console.log('reconnect:', wsUrl);
             this.connect(wsUrl);
         },

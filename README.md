@@ -202,6 +202,7 @@ Routes are registered under `/api/plugins/{plugin_id}/` to avoid conflicts.
 | [Tab View](https://github.com/byrongamatos/slopsmith-plugin-tabview) | Scrolling guitar tablature notation via alphaTab | `git clone ...slopsmith-plugin-tabview.git tab_view` |
 | [MIDI Amp Control](https://github.com/byrongamatos/slopsmith-plugin-midi) | Auto-switch amp/modeler presets via MIDI on tone changes | `git clone ...slopsmith-plugin-midi.git midi_amp` |
 | [Section Map](https://github.com/byrongamatos/slopsmith-plugin-sectionmap) | Color-coded song structure minimap with clickable navigation | `git clone ...slopsmith-plugin-sectionmap.git section_map` |
+| [RS1 Extractor](https://github.com/byrongamatos/slopsmith-plugin-rs1extract) | Extract RS1 compatibility songs into individual CDLCs | `git clone ...slopsmith-plugin-rs1extract.git rs1_extract` |
 
 Install any plugin by cloning it into your `plugins/` directory and restarting:
 

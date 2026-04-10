@@ -18,31 +18,62 @@ RSCLI = Path(os.environ.get("RSCLI_PATH", str(Path(__file__).parent / "tools" / 
 
 
 def get_tuning(psarc_path: str) -> tuple[list[int], bool]:
-    """Extract tuning from a PSARC. Returns (offsets, is_uniform)."""
+    """Extract tuning from a PSARC. Returns (offsets, is_uniform).
+    Prefers guitar (Lead/Rhythm/Combo) arrangements over Bass."""
     tmp = Path(tempfile.mkdtemp(prefix="rs_tune_"))
     try:
         unpack_psarc(psarc_path, str(tmp))
-        for xml_path in sorted(tmp.rglob("*.xml")):
+        # Also try reading from manifest JSON (works for SNG-only files)
+        guitar_tuning = None
+        fallback_tuning = None
+        # Check manifests first
+        for jf in sorted(tmp.rglob("*.json")):
             try:
-                tree = ET.parse(xml_path)
-                root = tree.getroot()
-            except ET.ParseError:
+                import json
+                data = json.loads(jf.read_text())
+                for k, v in data.get("Entries", {}).items():
+                    attrs = v.get("Attributes", {})
+                    arr_name = attrs.get("ArrangementName", "")
+                    tun = attrs.get("Tuning", {})
+                    if not tun or arr_name in ("Vocals", "ShowLights", "JVocals"):
+                        continue
+                    offsets = [tun.get(f"string{i}", 0) for i in range(6)]
+                    if arr_name in ("Lead", "Rhythm", "Combo"):
+                        if guitar_tuning is None:
+                            guitar_tuning = offsets
+                    elif fallback_tuning is None:
+                        fallback_tuning = offsets
+            except Exception:
                 continue
-            if root.tag != "song":
-                continue
-            arr = root.find("arrangement")
-            if arr is not None and arr.text:
-                low = arr.text.lower().strip()
-                if low in ("vocals", "showlights", "jvocals"):
+        # Check XMLs as fallback
+        if guitar_tuning is None and fallback_tuning is None:
+            for xml_path in sorted(tmp.rglob("*.xml")):
+                try:
+                    tree = ET.parse(xml_path)
+                    root = tree.getroot()
+                except ET.ParseError:
                     continue
-            tuning = root.find("tuning")
-            if tuning is not None:
-                offsets = [int(tuning.get(f"string{i}", "0")) for i in range(6)]
-                is_uniform = len(set(offsets)) == 1
-                return offsets, is_uniform
+                if root.tag != "song":
+                    continue
+                arr = root.find("arrangement")
+                if arr is not None and arr.text:
+                    low = arr.text.lower().strip()
+                    if low in ("vocals", "showlights", "jvocals"):
+                        continue
+                tuning = root.find("tuning")
+                if tuning is not None:
+                    offsets = [int(tuning.get(f"string{i}", "0")) for i in range(6)]
+                    fname = xml_path.stem.lower()
+                    if "lead" in fname or "rhythm" in fname or "combo" in fname:
+                        if guitar_tuning is None:
+                            guitar_tuning = offsets
+                    elif fallback_tuning is None:
+                        fallback_tuning = offsets
+        best = guitar_tuning or fallback_tuning or [0] * 6
+        is_uniform = len(set(best)) == 1
+        return best, is_uniform
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    return [0] * 6, True
 
 
 def _pitch_shift_wem(wem_path: Path, semitones: int) -> bool:

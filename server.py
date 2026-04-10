@@ -128,15 +128,14 @@ class MetadataDB:
             return len(stale)
 
     def _estd_set(self) -> set[str]:
-        """Get set of filename stems that have an _EStd_ variant in the DB."""
+        """Get set of filenames that have a retuned variant (_EStd_ or _DropD_) in the DB."""
         rows = self.conn.execute(
-            "SELECT filename FROM songs WHERE filename LIKE '%\\_EStd\\_%' ESCAPE '\\'"
+            "SELECT filename FROM songs WHERE filename LIKE '%\\_EStd\\_%' ESCAPE '\\' "
+            "OR filename LIKE '%\\_DropD\\_%' ESCAPE '\\'"
         ).fetchall()
-        # For each EStd file, derive the original stem
         originals = set()
         for (fname,) in rows:
-            # "SongName_Artist_EStd_p.psarc" -> original is "SongName_Artist_p.psarc"
-            originals.add(fname.replace("_EStd_", "_"))
+            originals.add(fname.replace("_EStd_", "_").replace("_DropD_", "_"))
         return originals
 
     def query_page(self, q: str = "", page: int = 0, size: int = 24,
@@ -662,8 +661,8 @@ def save_settings(data: dict):
 
 
 @app.websocket("/ws/retune")
-async def ws_retune(websocket: WebSocket, filename: str):
-    """Retune a song to E standard with real-time progress."""
+async def ws_retune(websocket: WebSocket, filename: str, target: str = "E Standard"):
+    """Retune a song to a target tuning with real-time progress."""
     import asyncio
     await websocket.accept()
 
@@ -690,14 +689,26 @@ async def ws_retune(websocket: WebSocket, filename: str):
         try:
             report("Checking tuning...", 5)
             offsets, uniform = get_tuning(str(psarc_path))
-            if all(o == 0 for o in offsets):
-                progress_queue.put_nowait({"error": "Already in E Standard"})
-                return
-            if not uniform:
-                progress_queue.put_nowait({"error": f"Non-uniform tuning {offsets} — only standard tunings supported"})
+
+            # Determine target offsets
+            if target == "Drop D":
+                target_offsets = [-2, 0, 0, 0, 0, 0]
+            else:
+                target_offsets = [0, 0, 0, 0, 0, 0]
+
+            # Check if already at target
+            if offsets == target_offsets:
+                progress_queue.put_nowait({"error": f"Already in {target}"})
                 return
 
-            semitones = -offsets[0]
+            # For uniform tunings (all same offset), shift everything to 0
+            # For drop tunings, check if the shift is uniform
+            shift = [target_offsets[i] - offsets[i] for i in range(6)]
+            if len(set(shift)) != 1:
+                progress_queue.put_nowait({"error": f"Cannot uniformly retune {offsets} to {target} — shift varies per string"})
+                return
+
+            semitones = shift[0]
             report("Extracting PSARC...", 10)
 
             import builtins
@@ -715,7 +726,12 @@ async def ws_retune(websocket: WebSocket, filename: str):
 
             builtins.print = _progress_print
             try:
-                result = retune_to_standard(str(psarc_path))
+                # Set custom output path based on target
+                suffix = "_EStd" if target == "E Standard" else "_DropD"
+                p = Path(psarc_path)
+                stem = p.stem.replace("_p", "")
+                out_path = str(p.parent / f"{stem}{suffix}_p.psarc")
+                result = retune_to_standard(str(psarc_path), output_path=out_path)
             finally:
                 builtins.print = _orig_print
 

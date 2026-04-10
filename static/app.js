@@ -106,12 +106,18 @@ function renderGridCards(songs, containerId = 'lib-grid') {
         const duration = s.duration ? formatTime(s.duration) : '';
         const tuning = s.tuning || '';
         const artUrl = `/api/song/${encodeURIComponent(s.filename)}/art`;
-        const canRetune = tuning && tuning !== 'E Standard' && !s.has_estd &&
+        const stdRetune = tuning && !s.has_estd &&
             ['Eb Standard', 'D Standard', 'C# Standard', 'C Standard'].includes(tuning);
-        const retuneBtn = canRetune
-            ? `<button data-retune="${encodeURIComponent(s.filename)}" data-title="${encodeURIComponent(title)}" data-tuning="${tuning}"
+        const dropRetune = tuning && !s.has_estd &&
+            ['Drop C', 'Drop C#', 'Drop Bb', 'Drop A'].includes(tuning);
+        const retuneBtn = stdRetune
+            ? `<button data-retune="${encodeURIComponent(s.filename)}" data-title="${encodeURIComponent(title)}" data-tuning="${tuning}" data-target="E Standard"
                 class="retune-btn mt-2 w-full px-2 py-1.5 bg-gold/10 hover:bg-gold/20 border border-gold/20 rounded-lg text-xs font-medium text-gold transition">
                 ⬆ Convert to E Standard</button>`
+            : dropRetune
+            ? `<button data-retune="${encodeURIComponent(s.filename)}" data-title="${encodeURIComponent(title)}" data-tuning="${tuning}" data-target="Drop D"
+                class="retune-btn mt-2 w-full px-2 py-1.5 bg-gold/10 hover:bg-gold/20 border border-gold/20 rounded-lg text-xs font-medium text-gold transition">
+                ⬆ Convert to Drop D</button>`
             : '';
         return `<div class="song-card group" data-play="${encodeURIComponent(s.filename)}">
             <div class="card-art">
@@ -226,8 +232,12 @@ async function renderTreeInto(containerId, countId, stats, letter, q, favoritesO
                 const title = s.title || s.filename;
                 const duration = s.duration ? formatTime(s.duration) : '';
                 const tuning = s.tuning || '';
-                const canRetune = tuning && tuning !== 'E Standard' && !s.has_estd &&
+                const stdRetune = tuning && !s.has_estd &&
                     ['Eb Standard', 'D Standard', 'C# Standard', 'C Standard'].includes(tuning);
+                const dropRetune = tuning && !s.has_estd &&
+                    ['Drop C', 'Drop C#', 'Drop Bb', 'Drop A'].includes(tuning);
+                const canRetune = stdRetune || dropRetune;
+                const retuneTarget = stdRetune ? 'E Standard' : 'Drop D';
                 html += `<div class="song-row" data-play="${encodeURIComponent(s.filename)}">`;
                 html += `<div class="flex-1 min-w-0"><span class="text-sm text-white truncate block">${esc(title)}</span></div>`;
                 html += `<div class="flex items-center gap-1.5 flex-shrink-0 text-xs">`;
@@ -245,8 +255,8 @@ async function renderTreeInto(containerId, countId, stats, letter, q, favoritesO
                 if (duration)
                     html += `<span class="text-gray-600 w-10 text-right">${duration}</span>`;
                 if (canRetune)
-                    html += `<button data-retune="${encodeURIComponent(s.filename)}" data-title="${encodeURIComponent(title)}" data-tuning="${tuning}"
-                        class="retune-btn px-1.5 py-0.5 bg-gold/10 hover:bg-gold/20 border border-gold/20 rounded text-gold" title="Convert to E Standard">E</button>`;
+                    html += `<button data-retune="${encodeURIComponent(s.filename)}" data-title="${encodeURIComponent(title)}" data-tuning="${tuning}" data-target="${retuneTarget}"
+                        class="retune-btn px-1.5 py-0.5 bg-gold/10 hover:bg-gold/20 border border-gold/20 rounded text-gold" title="Convert to ${retuneTarget}">${dropRetune ? 'D' : 'E'}</button>`;
                 html += editBtn(s);
                 html += heartBtn(s.filename, s.favorite);
                 html += `</div></div>`;
@@ -459,8 +469,9 @@ async function fullRescanLibrary() {
 // (searchCF, installCF, loginCF, searchUG, buildFromUG, etc.)
 
 // ── Retune ───────────────────────────────────────────────────────────────
-function retuneSong(filename, title, tuning) {
-    if (!confirm(`Convert "${title}" from ${tuning} to E Standard?`)) return;
+function retuneSong(filename, title, tuning, target) {
+    target = target || 'E Standard';
+    if (!confirm(`Convert "${title}" from ${tuning} to ${target}?`)) return;
 
     // Show modal overlay
     const modal = document.createElement('div');
@@ -468,14 +479,14 @@ function retuneSong(filename, title, tuning) {
     modal.className = 'fixed inset-0 z-[200] flex items-center justify-center bg-black/70 backdrop-blur-sm';
     modal.innerHTML = `
         <div class="bg-dark-700 border border-gray-700 rounded-2xl p-8 w-full max-w-md mx-4 shadow-2xl">
-            <h3 class="text-lg font-bold text-white mb-1">Converting to E Standard</h3>
+            <h3 class="text-lg font-bold text-white mb-1">Converting to ${target}</h3>
             <p class="text-sm text-gray-400 mb-5">${title}</p>
             <div class="progress-bar mb-3"><div class="fill" id="retune-bar" style="width:0%"></div></div>
             <p class="text-xs text-gray-500" id="retune-stage">Connecting...</p>
         </div>`;
     document.body.appendChild(modal);
 
-    const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws/retune?filename=${encodeURIComponent(decodeURIComponent(filename))}`);
+    const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws/retune?filename=${encodeURIComponent(decodeURIComponent(filename))}&target=${encodeURIComponent(target)}`);
     ws.onmessage = (ev) => {
         const msg = JSON.parse(ev.data);
         if (msg.progress !== undefined) {
@@ -600,40 +611,11 @@ function changeArrangement(index) {
 
 function togglePlay() {
     if (isPlaying) {
-        audio.pause();
-        if (window._webAudioFallback) window._webAudioFallback.stop();
-        isPlaying = false;
+        audio.pause(); isPlaying = false;
         document.getElementById('btn-play').textContent = '▶ Play';
     } else {
-        isPlaying = true;
+        audio.play(); isPlaying = true;
         document.getElementById('btn-play').textContent = '⏸ Pause';
-        // Try native audio first
-        audio.play().then(function() {
-            // Check if it actually works after 1s
-            setTimeout(function() {
-                if (isPlaying && audio.currentTime < 0.1 && window._webAudioFallback) {
-                    // Native audio failed — try Web Audio
-                    if (window._webAudioFallback.isReady()) {
-                        window._webAudioFallback.play();
-                    } else {
-                        window._webAudioFallback.load(audio.src, function() {
-                            if (isPlaying) window._webAudioFallback.play();
-                        });
-                    }
-                }
-            }, 1000);
-        }).catch(function() {
-            // Native play rejected — go straight to Web Audio
-            if (window._webAudioFallback && audio.src) {
-                if (window._webAudioFallback.isReady()) {
-                    window._webAudioFallback.play();
-                } else {
-                    window._webAudioFallback.load(audio.src, function() {
-                        if (isPlaying) window._webAudioFallback.play();
-                    });
-                }
-            }
-        });
     }
 }
 
@@ -856,27 +838,7 @@ setInterval(() => {
         lastAudioTime = audio.currentTime;
         document.getElementById('hud-time').textContent = `${formatTime(audio.currentTime)} / ${formatTime(audio.duration)}`;
     }
-    // Check Web Audio fallback first
-    var waFb = window._webAudioFallback;
-    var waTime = (waFb && waFb.isActive()) ? waFb.getTime() : -1;
-
-    if (waTime >= 0 && isPlaying && !_countingIn) {
-        // Web Audio is playing — use its time
-        highway.setTime(waTime + (window._slopsmithSyncOffset || 0));
-        var dur = waFb.getDuration() || 0;
-        document.getElementById('hud-time').textContent = formatTime(waTime) + ' / ' + formatTime(dur);
-    } else if (isPlaying && audio.currentTime < 0.1 && !_countingIn) {
-        // Audio stuck — use timer fallback (no audio)
-        if (!window._iosFbStart) window._iosFbStart = Date.now();
-        var elapsed = (Date.now() - window._iosFbStart) / 1000;
-        if (elapsed > 2) {
-            highway.setTime(elapsed * (audio.playbackRate || 1));
-            document.getElementById('hud-time').textContent = formatTime(elapsed) + ' / --:--';
-        }
-    } else {
-        window._iosFbStart = null;
-        if (!_countingIn) highway.setTime(audio.currentTime + (window._slopsmithSyncOffset || 0));
-    }
+    if (!_countingIn) highway.setTime(audio.currentTime);
 }, 1000 / 60);
 
 // Keyboard shortcuts (player only)
@@ -1008,7 +970,7 @@ document.addEventListener('click', e => {
     const btn = e.target.closest('.retune-btn');
     if (btn) {
         e.stopPropagation();
-        retuneSong(btn.dataset.retune, decodeURIComponent(btn.dataset.title), btn.dataset.tuning);
+        retuneSong(btn.dataset.retune, decodeURIComponent(btn.dataset.title), btn.dataset.tuning, btn.dataset.target || 'E Standard');
         return;
     }
     // Song card

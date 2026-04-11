@@ -1070,6 +1070,17 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
                 except Exception as e:
                     print(f"Audio conversion failed: {e}")
 
+            # Clean up old audio cache files (keep max 100)
+            try:
+                audio_files = [f for f in STATIC_DIR.iterdir()
+                               if f.name.startswith("audio_") and f.suffix in (".mp3", ".ogg", ".wav")]
+                if len(audio_files) > 100:
+                    audio_files.sort(key=lambda f: f.stat().st_atime)
+                    for f in audio_files[:len(audio_files) - 100]:
+                        f.unlink(missing_ok=True)
+            except Exception:
+                pass
+
         # Send song metadata
         arr_list = [{"index": i, "name": a.name, "notes": len(a.notes) + sum(len(c.notes) for c in a.chords)}
                     for i, a in enumerate(song.arrangements)]

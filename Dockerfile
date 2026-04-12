@@ -1,5 +1,8 @@
 # ── Stage 1: Build RsCli ─────────────────────────────────────────────────
+# TARGETARCH matches the final image (arm64 on Apple Silicon, amd64 on Intel/x86 servers).
+# RsCli must match that arch: linux-x64 binaries do not run on linux/arm64.
 FROM python:3.12-slim AS builder
+ARG TARGETARCH
 
 RUN apt-get update && apt-get install -y --no-install-recommends curl git && rm -rf /var/lib/apt/lists/*
 
@@ -18,7 +21,12 @@ COPY rscli/Program.fs /tmp/rs2014/tools/RsCli/
 
 RUN sed -i 's|</PropertyGroup>|<NuGetAudit>false</NuGetAudit></PropertyGroup>|' /tmp/rs2014/Directory.Build.props \
     && cd /tmp/rs2014/tools/RsCli \
-    && dotnet publish -c Release -r linux-x64 --self-contained -o /opt/rscli
+    && case "$TARGETARCH" in \
+         arm64) RID=linux-arm64 ;; \
+         amd64) RID=linux-x64 ;; \
+         *) RID=linux-x64 ;; \
+       esac \
+    && dotnet publish -c Release -r "$RID" --self-contained -o /opt/rscli
 
 # ── Stage 2: Final image ────────────────────────────────────────────────
 FROM python:3.12-slim

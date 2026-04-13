@@ -270,12 +270,13 @@ def _run_demucs_remote(full_ogg: Path, out_dir: Path, model: str) -> Path:
     if not server_url:
         raise RuntimeError("No demucs server configured")
 
-    # Upload the audio file
+    # Upload the audio file — request all stems the model can produce
+    stem_list = "drums,bass,vocals,other,guitar,piano"
     with open(full_ogg, "rb") as f:
         resp = requests.post(
             f"{server_url}/separate",
             files={"file": (full_ogg.name, f, "audio/ogg")},
-            params={"model": model},
+            params={"model": model, "stems": stem_list},
             timeout=600,
         )
 

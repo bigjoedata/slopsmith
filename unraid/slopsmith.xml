@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>Slopsmith</Name>
+  <Repository>ghcr.io/byrongamatos/slopsmith</Repository>
+  <Registry>https://ghcr.io/byrongamatos/slopsmith</Registry>
+  <Network>bridge</Network>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/byrongamatos/slopsmith/issues</Support>
+  <Project>https://github.com/byrongamatos/slopsmith</Project>
+  <Overview>
+    A self-contained web application for browsing, playing, and practicing Rocksmith 2014 Custom DLC (CDLC). Runs entirely in Docker.
+    
+    DISCLAIMER: This is an unofficial, community-provided Docker image. The application is not actively maintained and may break at any time during major project architecture shifts.
+  </Overview>
+  <Category>MediaApp:Music;MediaServer:Music;</Category>
+  <WebUI>http://[IP]:[PORT:8000]</WebUI>
+  <Icon>https://raw.githubusercontent.com/byrongamatos/slopsmith/main/docs/player.png</Icon>
+  <Description>
+    A self-contained web application for browsing, playing, and practicing Rocksmith 2014 Custom DLC (CDLC). Runs entirely in Docker — no local dependencies required.
+  </Description>
+  
+  <!-- Network Ports -->
+  <Config Name="WebUI Port" Target="8000" Default="8000" Mode="tcp" Description="The port for Slopsmith Web UI" Type="Port" Display="always" Required="true" Mask="false">8000</Config>
+
+  <!-- Paths -->
+  <Config Name="DLC Directory" Target="/dlc" Default="/mnt/user/cdlc" Mode="ro" Description="Where your Rocksmith 2014 CDLC is stored." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/cdlc</Config>
+  <Config Name="Appdata Directory" Target="/config" Default="/mnt/user/appdata/slopsmith" Mode="rw" Description="Location for config DB and cache." Type="Path" Display="advanced" Required="true" Mask="false">/mnt/user/appdata/slopsmith</Config>
+
+  <!-- Plugin Setting Variables -->
+  <Config Name="Plugin - Install List" Target="INSTALL_PLUGINS" Default="" Mode="" Description="Comma separated list of git URLs to install. E.g. https://github.com/byrongamatos/slopsmith-plugin-ug.git, https://github.com/byrongamatos/slopsmith-plugin-tones.git" Type="Variable" Display="always" Required="false" Mask="false"></Config>
+  <Config Name="Plugin - Disable List" Target="DISABLE_PLUGINS" Default="" Mode="" Description="Comma separated list of plugin folder names to remove/disable. E.g. slopsmith-plugin-ug, slopsmith-plugin-tones" Type="Variable" Display="always" Required="false" Mask="false"></Config>
+  <Config Name="Plugin - Auto Update" Target="AUTO_UPDATE_PLUGINS" Default="true" Mode="" Description="Automatically `git pull` plugins to update them on container start." Type="Variable" Display="advanced" Required="false" Mask="false">true</Config>
+
+  <!-- Required System Variables -->
+  <Config Name="DLC_DIR Env" Target="DLC_DIR" Default="/dlc" Mode="" Description="Internal application environment variable for DLC dir" Type="Variable" Display="advanced" Required="true" Mask="false">/dlc</Config>
+  <Config Name="CONFIG_DIR Env" Target="CONFIG_DIR" Default="/config" Mode="" Description="Internal application environment variable for appdata config" Type="Variable" Display="advanced" Required="true" Mask="false">/config</Config>
+  <Config Name="DOTNET_SYSTEM_GLOBALIZATION_INVARIANT" Target="DOTNET_SYSTEM_GLOBALIZATION_INVARIANT" Default="1" Mode="" Description="Required by RsCli .NET tool" Type="Variable" Display="advanced" Required="true" Mask="false">1</Config>
+</Container>

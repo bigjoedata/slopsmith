@@ -59,6 +59,8 @@ COPY lib/ /app/lib/
 COPY static/ /app/static/
 COPY plugins/ /app/plugins/
 COPY server.py /app/
+COPY docker-entrypoint.sh /app/
+RUN chmod +x /app/docker-entrypoint.sh
 
 ENV PYTHONPATH=/app/lib:/app
 ENV RSCLI_PATH=/opt/rscli/RsCli
@@ -66,4 +68,4 @@ ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
 
 EXPOSE 8000
 
-CMD uvicorn server:app --host 0.0.0.0 --port 8000
+ENTRYPOINT ["/app/docker-entrypoint.sh"]

@@ -1,5 +1,8 @@
 # Slopsmith
 
+> [!WARNING]
+> **DISCLAIMER**: This is an unofficial, community-provided Docker image. I did not create Slopsmith, and this container is not actively maintained. It may break at any time during major project architecture shifts.
+
 A self-contained web application for browsing, playing, and practicing Rocksmith 2014 Custom DLC (CDLC). Runs entirely in Docker — no local dependencies required.
 
 [![Video Overview](https://img.youtube.com/vi/f_XTS9tVeaU/maxresdefault.jpg)](https://www.youtube.com/watch?v=f_XTS9tVeaU)

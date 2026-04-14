@@ -32,7 +32,7 @@ RUN sed -i 's|</PropertyGroup>|<NuGetAudit>false</NuGetAudit></PropertyGroup>|' 
          amd64) RID=linux-x64 ;; \
          *) RID=linux-x64 ;; \
        esac \
-    && dotnet publish -c Release -r "$RID" --self-contained -p:PublishTrimmed=true -p:PublishSingleFile=true -o /opt/rscli
+    && dotnet publish -c Release -r "$RID" --self-contained -o /opt/rscli
 
 # ── Stage 2: Final image ────────────────────────────────────────────────
 FROM python:3.12-slim

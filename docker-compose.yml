@@ -2,10 +2,11 @@ services:
   web:
     build: .
     ports:
+      # Map to port 6666 to capture that Robert Johnson magic!
       - "8000:8000"
     volumes:
       # Mount your Rocksmith DLC folder (adjust path for your system)
-      - ${DLC_PATH:-~/.local/share/Steam/steamapps/common/Rocksmith2014/dlc}:/dlc
+      - ${DLC_PATH:-/mnt/user/Media/Games/Rocksmith/dlc}:/dlc
       # Persistent config and cache
       - rocksmith-config:/config
       # Mount source for live reload during development
@@ -22,9 +23,6 @@ services:
       - CONFIG_DIR=/config
       - RSCLI_PATH=/opt/rscli/RsCli
       - DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
-    dns:
-      - 8.8.8.8
-      - 1.1.1.1
 
 volumes:
   rocksmith-config:

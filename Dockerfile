@@ -4,12 +4,18 @@
 FROM python:3.12-slim AS builder
 ARG TARGETARCH
 
-RUN apt-get update && apt-get install -y --no-install-recommends curl git && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends curl git unzip && rm -rf /var/lib/apt/lists/*
 
 RUN curl -sL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh \
     && chmod +x /tmp/dotnet-install.sh \
     && /tmp/dotnet-install.sh --channel 10.0 --install-dir /usr/share/dotnet \
     && ln -s /usr/share/dotnet/dotnet /usr/local/bin/dotnet
+
+# vgmstream-cli
+RUN curl -sL https://github.com/vgmstream/vgmstream/releases/download/r2083/vgmstream-linux-cli.zip -o /tmp/vgm.zip \
+    && unzip -o /tmp/vgm.zip -d /usr/local/bin/ \
+    && chmod +x /usr/local/bin/vgmstream-cli \
+    && rm /tmp/vgm.zip
 
 ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1
@@ -26,7 +32,7 @@ RUN sed -i 's|</PropertyGroup>|<NuGetAudit>false</NuGetAudit></PropertyGroup>|' 
          amd64) RID=linux-x64 ;; \
          *) RID=linux-x64 ;; \
        esac \
-    && dotnet publish -c Release -r "$RID" --self-contained -o /opt/rscli
+    && dotnet publish -c Release -r "$RID" --self-contained -p:PublishTrimmed=true -p:PublishSingleFile=true -o /opt/rscli
 
 # ── Stage 2: Final image ────────────────────────────────────────────────
 FROM python:3.12-slim
@@ -36,19 +42,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fluidsynth \
     fluid-soundfont-gm \
     libsndfile1 \
-    curl \
-    unzip \
     megatools \
+    git \
+    curl \
     && rm -rf /var/lib/apt/lists/*
-
-# vgmstream-cli
-RUN curl -sL https://github.com/vgmstream/vgmstream/releases/download/r2083/vgmstream-linux-cli.zip -o /tmp/vgm.zip \
-    && unzip -o /tmp/vgm.zip -d /usr/local/bin/ \
-    && chmod +x /usr/local/bin/vgmstream-cli \
-    && rm /tmp/vgm.zip
 
 # Copy RsCli from builder (no .NET SDK in final image)
 COPY --from=builder /opt/rscli /opt/rscli
+COPY --from=builder /usr/local/bin/vgmstream-cli /usr/local/bin/vgmstream-cli
 
 WORKDIR /app
 

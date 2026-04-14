@@ -7,7 +7,7 @@ services:
       - "8000:8000"
     volumes:
       # CDLC library folder on NAS
-      - /volume1/piracy/cdlc:/dlc
+      - /mnt/user/Media/Games/Rocksmith/dlc:/dlc
       # Persistent config, cache, favorites, loops, practice data
       - slopsmith-config:/config
     environment:

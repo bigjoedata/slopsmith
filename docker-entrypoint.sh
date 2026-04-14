@@ -4,6 +4,11 @@ set -e
 # Default to auto-updating plugins if present
 AUTO_UPDATE_PLUGINS=${AUTO_UPDATE_PLUGINS:-true}
 
+if [ -n "$INITIAL_CDLC_URL" ] && [ ! -f "/dlc/initial_cdlc.psarc" ]; then
+    echo "[Entrypoint] Downloading initial CDLC from $INITIAL_CDLC_URL..."
+    curl -sL "$INITIAL_CDLC_URL" -o "/dlc/initial_cdlc.psarc" || echo "[Entrypoint] Failed to download initial CDLC"
+fi
+
 # If INSTALL_PLUGINS is provided (comma-separated list of github clone URLs)
 if [ -n "$INSTALL_PLUGINS" ]; then
     echo "[Entrypoint] Managing plugins from INSTALL_PLUGINS..."

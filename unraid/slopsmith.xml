@@ -20,16 +20,21 @@
   </Description>
   
   <!-- Network Ports -->
-  <Config Name="WebUI Port" Target="8000" Default="8000" Mode="tcp" Description="The port for Slopsmith Web UI" Type="Port" Display="always" Required="true" Mask="false">8000</Config>
+  <!-- We map the default Host Port to 6666 to capture that Robert Johnson magic! -->
+  <Config Name="WebUI Port" Target="8000" Default="6666" Mode="tcp" Description="The port for Slopsmith Web UI (defaulted to 6666 for that crossroads magic)" Type="Port" Display="always" Required="true" Mask="false">6666</Config>
 
   <!-- Paths -->
-  <Config Name="DLC Directory" Target="/dlc" Default="/mnt/user/cdlc" Mode="ro" Description="Where your Rocksmith 2014 CDLC is stored." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/cdlc</Config>
+  <Config Name="DLC Directory" Target="/dlc" Default="/mnt/user/Media/Games/Rocksmith/dlc" Mode="ro" Description="Where your Rocksmith 2014 CDLC is stored." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/Media/Games/Rocksmith/dlc</Config>
   <Config Name="Appdata Directory" Target="/config" Default="/mnt/user/appdata/slopsmith" Mode="rw" Description="Location for config DB and cache." Type="Path" Display="advanced" Required="true" Mask="false">/mnt/user/appdata/slopsmith</Config>
 
   <!-- Plugin Setting Variables -->
   <Config Name="Plugin - Install List" Target="INSTALL_PLUGINS" Default="" Mode="" Description="Comma separated list of git URLs to install. E.g. https://github.com/byrongamatos/slopsmith-plugin-ug.git, https://github.com/byrongamatos/slopsmith-plugin-tones.git" Type="Variable" Display="always" Required="false" Mask="false"></Config>
   <Config Name="Plugin - Disable List" Target="DISABLE_PLUGINS" Default="" Mode="" Description="Comma separated list of plugin folder names to remove/disable. E.g. slopsmith-plugin-ug, slopsmith-plugin-tones" Type="Variable" Display="always" Required="false" Mask="false"></Config>
   <Config Name="Plugin - Auto Update" Target="AUTO_UPDATE_PLUGINS" Default="true" Mode="" Description="Automatically `git pull` plugins to update them on container start." Type="Variable" Display="advanced" Required="false" Mask="false">true</Config>
+
+  <!-- Optional Download Feature -->
+  <Config Name="Initial CDLC Download URL" Target="INITIAL_CDLC_URL" Default="" Mode="" Description="Optional: Provide a direct URL to a CDLC (.psarc) file to automatically download it to your DLC directory on the first launch." Type="Variable" Display="always" Required="false" Mask="false"></Config>
+
 
   <!-- Required System Variables -->
   <Config Name="DLC_DIR Env" Target="DLC_DIR" Default="/dlc" Mode="" Description="Internal application environment variable for DLC dir" Type="Variable" Display="advanced" Required="true" Mask="false">/dlc</Config>

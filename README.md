@@ -171,12 +171,12 @@ pct restore 200 /var/lib/vz/template/cache/slopsmith-ct.tar.zst \
     --net0 name=eth0,bridge=vmbr0,ip=dhcp --unprivileged 1 --start 1
 ```
 
-Override the default Rocksmith source path via environment: `ROCKSMITH_SRC_DLC=/path/to/Rocksmith2014 sudo bash build-proxmox-ct.sh`.
+Override the default Rocksmith source path via environment (use `sudo env` so the variable survives `sudo`): `sudo env ROCKSMITH_SRC_DLC=/path/to/Rocksmith2014 bash build-proxmox-ct.sh`.
 
-The build verifies downloaded files (vgmstream, dotnet-install.sh) against pinned SHA256 hashes. Until hashes are pinned, set `SKIP_HASH_CHECK=1` to allow the build to proceed:
+The build verifies downloaded files (vgmstream, dotnet-install.sh) against pinned SHA256 hashes. Set `SKIP_HASH_CHECK=1` to bypass verification — useful when an upstream artifact (e.g. `dot.net/v1/dotnet-install.sh`) rolls and the pinned hash hasn't been refreshed yet:
 
 ```bash
-sudo SKIP_HASH_CHECK=1 bash build-proxmox-ct.sh amd64 slopsmith-ct
+sudo env SKIP_HASH_CHECK=1 bash build-proxmox-ct.sh amd64 slopsmith-ct
 ```
 
 The script is linted with `shellcheck`. Only `amd64` is supported out of the box; `arm64` requires `qemu-user-static` + binfmt registration.

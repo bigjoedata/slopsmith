@@ -14,7 +14,10 @@
 #
 # Environment variables:
 #   ROCKSMITH_SRC_DLC   Path to Rocksmith2014 install (default: /mnt/z/Steam/...)
-#   SKIP_HASH_CHECK=1   Allow builds when SHA256 hashes are not yet pinned
+#   SKIP_HASH_CHECK=1   Bypass SHA256 verification — for unpinned hashes OR
+#                       to override mismatches when an upstream artifact rolls
+#                       (e.g. dot.net/v1/dotnet-install.sh). Use with caution.
+#   KEEP_BUILD_DIR=1    Retain ${BUILD_BASE} after a successful build
 #
 # Prerequisites (install in WSL):
 #   sudo apt install debootstrap systemd-container tar zstd curl unzip git
@@ -67,6 +70,9 @@ cleanup() {
   if [[ $rc -ne 0 && -d "${BUILD_BASE:-}" ]]; then
     warn "Build failed (exit $rc). Partial rootfs left at ${BUILD_BASE} for inspection."
     warn "Run 'sudo rm -rf ${BUILD_BASE}' to clean up."
+  elif [[ $rc -eq 0 && -d "${BUILD_BASE:-}" && "${KEEP_BUILD_DIR:-0}" != "1" ]]; then
+    info "Removing build directory ${BUILD_BASE} (set KEEP_BUILD_DIR=1 to retain)."
+    rm -rf "${BUILD_BASE}"
   fi
 }
 trap cleanup EXIT
@@ -117,7 +123,7 @@ fi
 
 # Confirm required tools
 for cmd in debootstrap systemd-nspawn curl unzip git tar zstd; do
-  command -v "$cmd" &>/dev/null || die "'$cmd' not found. Run: sudo apt install debootstrap systemd-container curl unzip git zstd"
+  command -v "$cmd" &>/dev/null || die "'$cmd' not found. Run: sudo apt install debootstrap systemd-container curl unzip git tar zstd"
 done
 
 # =============================================================================
@@ -140,7 +146,11 @@ info "Bootstrapping Debian Trixie (${DEBIAN_ARCH}) rootfs at ${ROOTFS} …"
 if [[ -d "$ROOTFS" ]]; then
   warn "Existing rootfs found at ${ROOTFS} – remove it to rebuild from scratch."
   read -rp "    Delete and rebuild? [y/N] " yn
-  [[ "$yn" =~ ^[Yy]$ ]] && rm -rf "$ROOTFS" || die "Aborting."
+  if [[ "$yn" =~ ^[Yy]$ ]]; then
+    rm -rf "$ROOTFS" || die "Failed to remove existing rootfs at ${ROOTFS}."
+  else
+    die "Aborting."
+  fi
 fi
 
 debootstrap \
@@ -152,9 +162,9 @@ debootstrap \
 
 ok "Bootstrap complete."
 
-# Bind /proc and /sys so apt and dotnet-install work inside nspawn
-# (systemd-nspawn does this automatically; just ensuring resolv.conf is live)
-echo "nameserver 1.1.1.1" > "$ROOTFS/etc/resolv.conf"
+# DNS during the build is supplied by the host's /etc/resolv.conf, which
+# r() bind-mounts read-only into nspawn. The rootfs's own /etc/resolv.conf
+# gets replaced with a systemd-resolved stub symlink in step 10(d).
 
 # =============================================================================
 # 2. System packages  (mirrors Stage 2 apt block)
@@ -337,7 +347,9 @@ After=network.target
 
 [Service]
 User=${SVC_USER}
-AmbientCapabilities=CAP_NET_BIND_SERVICE
+# Default port (8000) is non-privileged; uncomment the next line only if
+# you set PORT<1024 in /etc/environment so the unit can bind it.
+# AmbientCapabilities=CAP_NET_BIND_SERVICE
 WorkingDirectory=${APP_DIR}
 EnvironmentFile=/etc/environment
 ExecStart=${VENV_DIR}/bin/python3 main.py

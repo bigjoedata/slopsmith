@@ -38,7 +38,11 @@ OUTPUT_NAME="${2:-slopsmith-ct}"
 # device nodes that NTFS/FUSE mounts (/mnt/c, /mnt/d …) cannot represent.
 # We build everything under /tmp (tmpfs) and copy the final tarball back.
 PROJECT_DIR="$(pwd)"          # may be on /mnt/d – that's fine for source files
-BUILD_BASE="/tmp/proxmox-ct-build"
+# Namespace BUILD_BASE by OUTPUT_NAME + TARGETARCH so concurrent invocations
+# (or stale leftovers from a prior build of a different artifact) don't
+# collide on /tmp/proxmox-ct-build/rootfs. BUILD_BASE can still be overridden
+# via the environment for users who want a known, reusable path.
+BUILD_BASE="${BUILD_BASE:-/tmp/proxmox-ct-build-${OUTPUT_NAME}-${TARGETARCH}}"
 ROOTFS="${BUILD_BASE}/rootfs"
 mkdir -p "$BUILD_BASE"
 
@@ -195,7 +199,13 @@ ok "Bootstrap complete."
 # 2. System packages  (mirrors Stage 2 apt block)
 # =============================================================================
 info "Installing system packages …"
+# systemd-sysv + systemd-resolved are explicit because the final container
+# enables systemd-networkd/systemd-resolved units in step 10 and rewrites
+# /etc/resolv.conf to the resolved stub — a minimal debootstrap does not
+# guarantee these binaries on its own, which would yield broken DNS in the
+# imported CT.
 r "apt-get update -qq && apt-get install -y --no-install-recommends \
+    systemd-sysv systemd-resolved \
     python3 python3-pip python3-venv \
     ffmpeg \
     fluidsynth \

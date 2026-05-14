@@ -216,6 +216,13 @@ def _measure_duration_secs(
     return _tick_to_seconds(end_tick, tempo_map) - _tick_to_seconds(mh.start, tempo_map)
 
 
+def _measure_beat_tick(mh: guitarpro.MeasureHeader, beat_index: int) -> int:
+    """Return the authored tick for a time-signature beat subdivision."""
+    ts = mh.timeSignature
+    quarter_notes = beat_index * (4.0 / ts.denominator.value)
+    return mh.start + int(round(quarter_notes * GP_TICKS_PER_QUARTER))
+
+
 # Names that may appear in MeasureHeader.fromDirection (jump *sources*).
 _DA_CAPO_NAMES = frozenset({
     "Da Capo", "Da Capo al Coda", "Da Capo al Double Coda", "Da Capo al Fine",
@@ -589,7 +596,7 @@ def convert_track(
         # into output time by the entry's output_start.
         num_beats_in_measure = mh.timeSignature.numerator
         for b in range(1, num_beats_in_measure):
-            sub_tick = mh.start + b * GP_TICKS_PER_QUARTER
+            sub_tick = _measure_beat_tick(mh, b)
             sub_offset_in_measure = _tick_to_seconds(sub_tick, tempo_map) \
                 - entry.mh_authored_start_secs
             beats.append(RsBeat(
@@ -1133,7 +1140,7 @@ def convert_piano_track(
         ))
         num_beats_in_measure = mh.timeSignature.numerator
         for b in range(1, num_beats_in_measure):
-            sub_tick = mh.start + b * GP_TICKS_PER_QUARTER
+            sub_tick = _measure_beat_tick(mh, b)
             sub_offset_in_measure = _tick_to_seconds(sub_tick, tempo_map) \
                 - entry.mh_authored_start_secs
             beats.append(RsBeat(
@@ -1316,7 +1323,7 @@ def convert_drum_track(
         ))
         num_beats_in_measure = mh.timeSignature.numerator
         for b in range(1, num_beats_in_measure):
-            sub_tick = mh.start + b * GP_TICKS_PER_QUARTER
+            sub_tick = _measure_beat_tick(mh, b)
             sub_offset_in_measure = _tick_to_seconds(sub_tick, tempo_map) \
                 - entry.mh_authored_start_secs
             beats.append(RsBeat(

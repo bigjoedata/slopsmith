@@ -10,6 +10,7 @@ See issue #46 (tempo math) and the GP repeat-expansion PR for the schedule
 walker.
 """
 
+import xml.etree.ElementTree as ET
 from types import SimpleNamespace
 from unittest import mock
 
@@ -26,6 +27,9 @@ from gp2rs import (
     _standard_tuning_for,
     _tempo_at_tick,
     _tick_to_seconds,
+    convert_drum_track,
+    convert_piano_track,
+    convert_track,
 )
 
 
@@ -40,6 +44,183 @@ def _fake_track(string_midis, instrument=24):
                for i, v in enumerate(string_midis)]
     channel = SimpleNamespace(instrument=instrument)
     return SimpleNamespace(strings=strings, channel=channel)
+
+
+def _minimal_converter_song(numerator=4, denominator=4, tempo_changes=None):
+    """Fake song shape sufficient for converter-level XML tests."""
+    strings = [
+        SimpleNamespace(number=1, value=64),
+        SimpleNamespace(number=2, value=59),
+        SimpleNamespace(number=3, value=55),
+        SimpleNamespace(number=4, value=50),
+        SimpleNamespace(number=5, value=45),
+        SimpleNamespace(number=6, value=40),
+    ]
+    beats = [SimpleNamespace(start=0, notes=[], effect=None)]
+    for tick, tempo in tempo_changes or []:
+        beats.append(SimpleNamespace(
+            start=tick,
+            notes=[],
+            effect=SimpleNamespace(
+                mixTableChange=SimpleNamespace(
+                    tempo=SimpleNamespace(value=tempo),
+                ),
+            ),
+        ))
+    measure = SimpleNamespace(
+        voices=[SimpleNamespace(beats=beats)],
+    )
+    header = SimpleNamespace(
+        start=0,
+        number=1,
+        timeSignature=SimpleNamespace(
+            numerator=numerator,
+            denominator=SimpleNamespace(value=denominator),
+        ),
+        isRepeatOpen=False,
+        repeatClose=-1,
+        repeatAlternative=0,
+        direction=None,
+        fromDirection=None,
+        marker=None,
+    )
+    track = SimpleNamespace(
+        name="Guitar",
+        strings=strings,
+        channel=SimpleNamespace(instrument=24),
+        measures=[measure],
+        isPercussionTrack=False,
+    )
+    return SimpleNamespace(
+        title="Test Song",
+        artist="Test Artist",
+        album="",
+        copyright="",
+        subtitle="",
+        tempo=120,
+        measureHeaders=[header],
+        tracks=[track],
+    )
+
+
+def _converter_ebeats(converter, numerator, denominator, tempo_changes=None):
+    song = _minimal_converter_song(
+        numerator=numerator,
+        denominator=denominator,
+        tempo_changes=tempo_changes,
+    )
+    root = ET.fromstring(converter(song, 0))
+    return root.find("ebeats")
+
+
+def _assert_ebeats(converter, numerator, denominator, expected_times, tempo_changes=None):
+    ebeats = _converter_ebeats(converter, numerator, denominator, tempo_changes)
+
+    assert [ebeat.get("time") for ebeat in ebeats] == expected_times
+    assert [ebeat.get("measure") for ebeat in ebeats] == [
+        "1",
+        *["-1"] * (len(expected_times) - 1),
+    ]
+
+
+@pytest.mark.parametrize("converter", [
+    convert_track,
+    convert_piano_track,
+    convert_drum_track,
+])
+def test_converter_ebeats_use_time_signature_denominator_for_6_8(converter):
+    _assert_ebeats(converter, 6, 8, [
+        "0.000",
+        "0.250",
+        "0.500",
+        "0.750",
+        "1.000",
+        "1.250",
+    ])
+
+
+@pytest.mark.parametrize("converter", [
+    convert_track,
+    convert_piano_track,
+    convert_drum_track,
+])
+def test_converter_ebeats_preserve_quarter_note_spacing_for_4_4(converter):
+    _assert_ebeats(converter, 4, 4, [
+        "0.000",
+        "0.500",
+        "1.000",
+        "1.500",
+    ])
+
+
+@pytest.mark.parametrize("converter", [
+    convert_track,
+    convert_piano_track,
+    convert_drum_track,
+])
+@pytest.mark.parametrize(("numerator", "denominator", "expected_times"), [
+    pytest.param(12, 8, [
+        "0.000",
+        "0.250",
+        "0.500",
+        "0.750",
+        "1.000",
+        "1.250",
+        "1.500",
+        "1.750",
+        "2.000",
+        "2.250",
+        "2.500",
+        "2.750",
+    ], id="12_8"),
+    pytest.param(3, 8, [
+        "0.000",
+        "0.250",
+        "0.500",
+    ], id="3_8"),
+    pytest.param(2, 2, [
+        "0.000",
+        "1.000",
+    ], id="2_2"),
+    pytest.param(5, 16, [
+        "0.000",
+        "0.125",
+        "0.250",
+        "0.375",
+        "0.500",
+    ], id="5_16"),
+])
+def test_converter_ebeats_scale_by_denominator_for_other_meters(
+    converter,
+    numerator,
+    denominator,
+    expected_times,
+):
+    _assert_ebeats(converter, numerator, denominator, expected_times)
+
+
+@pytest.mark.parametrize("converter", [
+    convert_track,
+    convert_piano_track,
+    convert_drum_track,
+])
+def test_converter_ebeats_apply_internal_tempo_changes_in_6_8(converter):
+    _assert_ebeats(
+        converter,
+        6,
+        8,
+        [
+            "0.000",
+            "0.250",
+            "0.500",
+            "1.000",
+            "1.500",
+            "2.000",
+        ],
+        tempo_changes=[
+            (GP_TICKS_PER_QUARTER, 60),
+        ],
+    )
 
 
 # ── _tick_to_seconds ─────────────────────────────────────────────────────────

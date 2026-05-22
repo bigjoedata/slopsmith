@@ -623,6 +623,7 @@ def convert_track(
     rs_chords = []
     chord_templates: list[ChordTemplate] = []
     chord_template_map: dict[tuple, int] = {}  # fret tuple → index
+    last_note_per_string: dict[int, RsNote] = {}  # for tie sustain extension
 
     for entry in schedule:
         measure = track.measures[entry.mh_index]
@@ -643,6 +644,13 @@ def convert_track(
                         continue
 
                     rs_str = _gp_string_to_rs(note.string, num_strings)
+
+                    if note.type == guitarpro.NoteType.tie:
+                        prev = last_note_per_string.get(rs_str)
+                        if prev is not None:
+                            prev.sustain = max(prev.sustain, (t + dur) - prev.time)
+                        continue
+
                     fret = note.value
                     if note.type == guitarpro.NoteType.dead:
                         fret = max(fret, 0)
@@ -692,6 +700,7 @@ def convert_track(
                         rn.tremolo = True
 
                     beat_notes.append(rn)
+                    last_note_per_string[rs_str] = rn
 
                 if not beat_notes:
                     continue
@@ -1163,6 +1172,7 @@ def convert_piano_track(
     rs_chords = []
     chord_templates: list[ChordTemplate] = []
     chord_template_map: dict[tuple, int] = {}
+    last_note_per_string: dict[int, RsNote] = {}  # for tie sustain extension
 
     for entry in schedule:
         measure = track.measures[entry.mh_index]
@@ -1196,6 +1206,12 @@ def convert_piano_track(
                     rs_string = midi_note // 24
                     rs_fret = midi_note % 24
 
+                    if note.type == guitarpro.NoteType.tie:
+                        prev = last_note_per_string.get(rs_string)
+                        if prev is not None:
+                            prev.sustain = max(prev.sustain, (t + dur) - prev.time)
+                        continue
+
                     rn = RsNote(
                         time=t,
                         string=rs_string,
@@ -1210,6 +1226,7 @@ def convert_piano_track(
                         rn.accent = True
 
                     beat_notes.append(rn)
+                    last_note_per_string[rs_string] = rn
 
                 if not beat_notes:
                     continue

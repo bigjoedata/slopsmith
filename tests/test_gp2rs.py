@@ -10,9 +10,11 @@ See issue #46 (tempo math) and the GP repeat-expansion PR for the schedule
 walker.
 """
 
+import xml.etree.ElementTree as ET
 from types import SimpleNamespace
 from unittest import mock
 
+import guitarpro
 import pytest
 
 from gp2rs import (
@@ -26,6 +28,7 @@ from gp2rs import (
     _standard_tuning_for,
     _tempo_at_tick,
     _tick_to_seconds,
+    convert_track,
 )
 
 
@@ -568,3 +571,127 @@ def test_schedule_irregular_measure_lengths():
     #   A: 0.0, B: 1.5 (3 q), C: 3.5 (4 q), D pass 0: 5.5 (4 q), D pass 1: 7.5
     out = [round(e.output_start_secs, 3) for e in schedule]
     assert out == [0.0, 1.5, 3.5, 5.5, 7.5]
+
+
+# ── convert_track: tied-note (NoteType.tie) handling ─────────────────────────
+# Tied notes in GP are displayed with brackets, e.g. (0). They should extend
+# the sustain of the previous note on the same string, not emit a second note.
+
+def _ct_note_effect():
+    return SimpleNamespace(
+        bend=None,
+        hammer=False,
+        slides=[],
+        harmonic=None,
+        palmMute=False,
+        accentuatedNote=False,
+        heavyAccentuatedNote=False,
+        ghostNote=False,
+        vibrato=False,
+        tremoloPicking=False,
+    )
+
+
+def _ct_beat(tick, dur_value, notes):
+    return SimpleNamespace(
+        start=tick,
+        duration=SimpleNamespace(
+            value=dur_value,
+            isDotted=False,
+            tuplet=SimpleNamespace(enters=1, times=1),
+        ),
+        notes=notes,
+        effect=SimpleNamespace(mixTableChange=None),
+    )
+
+
+def _ct_note(note_type, gp_string, fret):
+    return SimpleNamespace(
+        type=note_type,
+        string=gp_string,
+        value=fret,
+        effect=_ct_note_effect(),
+    )
+
+
+def _ct_song(beats):
+    """One-measure mock song for convert_track, standard 6-string guitar at 120 BPM."""
+    voice = SimpleNamespace(beats=beats)
+    measure = SimpleNamespace(voices=[voice])
+    strings = [SimpleNamespace(number=i + 1, value=v)
+               for i, v in enumerate([64, 59, 55, 50, 45, 40])]
+    track = SimpleNamespace(
+        strings=strings,
+        channel=SimpleNamespace(instrument=24),
+        measures=[measure],
+        name="Guitar",
+    )
+    mh = SimpleNamespace(
+        start=0,
+        number=1,
+        timeSignature=SimpleNamespace(
+            numerator=4,
+            denominator=SimpleNamespace(value=4),
+        ),
+        isRepeatOpen=False,
+        repeatClose=-1,
+        repeatAlternative=0,
+        direction=None,
+        fromDirection=None,
+        marker=None,
+    )
+    return SimpleNamespace(
+        title="Test",
+        artist="Test",
+        album="Test",
+        copyright=None,
+        subtitle=None,
+        tempo=120,
+        tracks=[track],
+        measureHeaders=[mh],
+    )
+
+
+def test_tied_note_extends_sustain_not_duplicate():
+    """NoteType.tie should extend the previous note's sustain, not emit a new note."""
+    # quarter note at 120 BPM = 0.5 s; two tied quarters → 1.0 s total sustain
+    note1 = _ct_note(guitarpro.NoteType.normal, gp_string=1, fret=5)
+    note2 = _ct_note(guitarpro.NoteType.tie, gp_string=1, fret=5)
+    beat1 = _ct_beat(tick=0, dur_value=4, notes=[note1])
+    beat2 = _ct_beat(tick=GP_TICKS_PER_QUARTER, dur_value=4, notes=[note2])
+
+    xml_str = convert_track(_ct_song([beat1, beat2]), track_index=0)
+    root = ET.fromstring(xml_str)
+    notes = root.findall(".//notes/note")
+
+    assert len(notes) == 1, f"tie must not emit a second note; got {len(notes)}"
+    sustain = float(notes[0].get("sustain"))
+    assert sustain == pytest.approx(1.0, abs=0.01)
+    assert notes[0].get("fret") == "5"
+
+
+def test_tied_note_without_predecessor_is_silently_dropped():
+    """A tie with no previous note on that string is silently skipped."""
+    note = _ct_note(guitarpro.NoteType.tie, gp_string=1, fret=0)
+    beat = _ct_beat(tick=0, dur_value=4, notes=[note])
+
+    xml_str = convert_track(_ct_song([beat]), track_index=0)
+    root = ET.fromstring(xml_str)
+    notes = root.findall(".//notes/note")
+    assert len(notes) == 0
+
+
+def test_two_normal_notes_on_same_string_are_both_emitted():
+    """Non-tied consecutive notes on the same string each produce a note event."""
+    note1 = _ct_note(guitarpro.NoteType.normal, gp_string=1, fret=5)
+    note2 = _ct_note(guitarpro.NoteType.normal, gp_string=1, fret=7)
+    beat1 = _ct_beat(tick=0, dur_value=4, notes=[note1])
+    beat2 = _ct_beat(tick=GP_TICKS_PER_QUARTER, dur_value=4, notes=[note2])
+
+    xml_str = convert_track(_ct_song([beat1, beat2]), track_index=0)
+    root = ET.fromstring(xml_str)
+    notes = root.findall(".//notes/note")
+
+    assert len(notes) == 2
+    assert notes[0].get("fret") == "5"
+    assert notes[1].get("fret") == "7"

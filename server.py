@@ -930,7 +930,12 @@ def _library_art_response(result: Any) -> Response:
         return result
     if isinstance(result, (bytes, bytearray, memoryview)):
         return Response(content=bytes(result), media_type="image/png")
-    if isinstance(result, (str, Path)):
+    if isinstance(result, str):
+        safe_url = _safe_art_redirect_url(result)
+        if safe_url is not None:
+            return RedirectResponse(safe_url)
+        return FileResponse(result)
+    if isinstance(result, Path):
         return FileResponse(str(result))
     if isinstance(result, dict):
         url = result.get("url") or result.get("art_url") or result.get("artUrl")

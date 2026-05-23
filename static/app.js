@@ -191,15 +191,18 @@ function _persistLibSelection(el) {
     if (!el || !el.dataset || !el.dataset.play) return;
     const key = _selectedKeyForActiveScreen();
     if (!key) return;
-    // Stored as JSON `{f, a}` — `f` (filename) drives the
+    // Stored as JSON `{f, a, p}` — `f` (filename) drives the
     // restore-by-attribute lookup; `a` (artist) is recorded for
     // future use (e.g. cross-page restore that needs to fetch the
-    // saved artist's letter bucket) but currently unread. The bare-
-    // string filename format older builds wrote is still tolerated
-    // in `_loadPersistedLibSelection`.
+    // saved artist's letter bucket) but currently unread; `p`
+    // (provider id, encoded) avoids cross-provider collisions when two
+    // providers sync to the same local filename. The bare-string
+    // filename format and the older `{f,a}` format (no `p`) older
+    // builds wrote are still tolerated in `_loadPersistedLibSelection`.
     const artist = el.dataset.artist || '';
+    const provider = el.dataset.libraryProvider || '';
     try {
-        localStorage.setItem(key, JSON.stringify({ f: el.dataset.play, a: artist }));
+        localStorage.setItem(key, JSON.stringify({ f: el.dataset.play, a: artist, p: provider }));
     } catch { /* private mode / quota */ }
 }
 
@@ -210,10 +213,10 @@ function _loadPersistedLibSelection(key) {
     // Tolerate the older bare-string format (just the encoded
     // filename) — older builds wrote that and we'd rather upgrade
     // silently than orphan the user's saved selection.
-    if (raw[0] !== '{') return { f: raw, a: '' };
+    if (raw[0] !== '{') return { f: raw, a: '', p: '' };
     try {
         const o = JSON.parse(raw);
-        return (o && typeof o === 'object') ? { f: o.f || '', a: o.a || '' } : null;
+        return (o && typeof o === 'object') ? { f: o.f || '', a: o.a || '', p: o.p || '' } : null;
     } catch { return null; }
 }
 
@@ -277,8 +280,15 @@ function _restoreLibSelection(scopeEl, screen, { scroll = true } = {}) {
     // decoding needed. Avoid interpolating persisted data into a CSS
     // selector so malformed localStorage cannot make querySelector
     // throw and break rendering.
+    // When `saved.p` (provider) is present, also require a matching
+    // `data-library-provider` so selections don't bleed across providers
+    // that happen to sync to the same local filename.
     const candidates = scopeEl.querySelectorAll('.song-card[data-play], .song-row[data-play]');
-    const el = Array.from(candidates).find((node) => node.dataset.play === saved.f);
+    const el = Array.from(candidates).find((node) => {
+        if (node.dataset.play !== saved.f) return false;
+        if (saved.p && node.dataset.libraryProvider !== saved.p) return false;
+        return true;
+    });
     if (!el) return null;
     // Open every collapsed ancestor in the tree so the restored row
     // is on-screen; harmless on the grid since cards have no such

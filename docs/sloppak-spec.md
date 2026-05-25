@@ -175,10 +175,10 @@ If present, points at a JSON file holding per-syllable pitch data — the karaok
 
 | Field | Meaning |
 |---|---|
-| `version` | Schema version (currently `1`). Bumped per the same rules as the manifest blocks |
+| `version` | Schema version of this `vocal_pitch.json` file (currently the integer `1`). Bump on a breaking change to the `notes` entry shape. This is *not* the same as the top-level `pitch_extraction.version` block below, which is a semver string used as a cache-key for the extractor engine |
 | `notes` | List of pitch entries, one per syllable that the extractor could lock onto. `t` + `d` mirror the matching `lyrics.json` entry; `midi` is the MIDI note number (60 = middle C). Syllables the extractor couldn't pitch (silent / sub-confidence) are omitted from this list — it may be shorter than `lyrics.json` |
 
-When pitch came from an automated engine (the demucs server's `/pitch` endpoint, which runs CREPE), the optional top-level `pitch_extraction` block records which engine + model produced the file. Same shape and semver semantics as `stem_separation` / `lyric_transcription`:
+When pitch came from an automated engine (the demucs server's `/pitch` endpoint, which runs CREPE), the optional top-level `pitch_extraction` block records which engine + model produced the file. Same shape and semver-string semantics as `stem_separation` / `lyric_transcription` — distinct from the in-file integer `version` field above:
 
 ```yaml
 pitch_extraction:

@@ -92,6 +92,17 @@ def test_extract_pitch_remote_no_headers_when_no_api_key(tmp_path, monkeypatch):
     assert captured["headers"] is None
 
 
+def test_extract_pitch_remote_wraps_request_exception_as_runtimeerror(tmp_path, monkeypatch):
+    vocals = tmp_path / "vocals.ogg"
+    vocals.write_bytes(b"")
+    import requests
+    def _raise(*a, **kw):
+        raise requests.ConnectionError("dns blew up")
+    monkeypatch.setattr(requests, "post", _raise)
+    with pytest.raises(RuntimeError, match="CREPE server request failed.*dns blew up"):
+        extract_pitch_remote(vocals, [{"t": 0, "d": 0.1, "w": "x"}], "http://server:7865")
+
+
 def test_extract_pitch_remote_raises_on_non_200(tmp_path, monkeypatch):
     vocals = tmp_path / "vocals.ogg"
     vocals.write_bytes(b"")

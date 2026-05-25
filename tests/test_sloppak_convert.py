@@ -671,3 +671,177 @@ def test_cleanup_stale_temp_dirs_skips_symlinks(tmp_path, monkeypatch):
     assert removed == 0
     assert link.exists()
     assert target.exists() and (target / "do_not_delete.txt").exists()
+
+
+# ── _maybe_extract_pitch ────────────────────────────────────────────────────
+# The pitch path is best-effort and gated on multiple config + filesystem
+# conditions. These cover the skip gates + the happy-path write to make
+# sure the sloppak ends up with vocal_pitch.json + manifest provenance,
+# and that early-exit paths don't crash or partially update the manifest.
+
+import json as _json
+import yaml as _yaml
+
+
+def _make_sloppak_with_vocals(tmp_path):
+    """Minimal unpacked-sloppak skeleton: manifest + stems/vocals.ogg."""
+    src = tmp_path / "song.sloppak"
+    src.mkdir()
+    (src / "manifest.yaml").write_text(
+        _yaml.safe_dump({"id": "song", "stems": [{"id": "vocals", "file": "stems/vocals.ogg"}]}),
+        encoding="utf-8",
+    )
+    (src / "stems").mkdir()
+    (src / "stems" / "vocals.ogg").write_bytes(b"fake-ogg")
+    return src
+
+
+def _patch_pitch_config(monkeypatch, **overrides):
+    """Stub _get_pitch_config so tests don't have to spin up a real config.json."""
+    base = {"enabled": True, "server_url": "http://stub:7865", "api_key": None}
+    base.update(overrides)
+    monkeypatch.setattr(sloppak_convert, "_get_pitch_config", lambda: base)
+    # Also clear the demucs-server fallback so server_url precedence is deterministic.
+    monkeypatch.setattr(sloppak_convert, "_get_demucs_server_url", lambda: None)
+
+
+def test_maybe_extract_pitch_skips_when_disabled(tmp_path, monkeypatch):
+    src = _make_sloppak_with_vocals(tmp_path)
+    _patch_pitch_config(monkeypatch, enabled=False)
+
+    out = sloppak_convert._maybe_extract_pitch(
+        src, [{"t": 0.0, "d": 0.5, "w": "hi"}], src / "stems" / "vocals.ogg",
+    )
+    assert out is False
+    assert not (src / "vocal_pitch.json").exists()
+    mf = _yaml.safe_load((src / "manifest.yaml").read_text(encoding="utf-8"))
+    assert "vocal_pitch" not in mf
+    assert "pitch_extraction" not in mf
+
+
+def test_maybe_extract_pitch_skips_when_no_lyrics(tmp_path, monkeypatch):
+    src = _make_sloppak_with_vocals(tmp_path)
+    _patch_pitch_config(monkeypatch)
+
+    out = sloppak_convert._maybe_extract_pitch(
+        src, [], src / "stems" / "vocals.ogg",
+    )
+    assert out is False
+    assert not (src / "vocal_pitch.json").exists()
+
+
+def test_maybe_extract_pitch_skips_when_vocals_missing(tmp_path, monkeypatch):
+    src = _make_sloppak_with_vocals(tmp_path)
+    (src / "stems" / "vocals.ogg").unlink()
+    _patch_pitch_config(monkeypatch)
+
+    out = sloppak_convert._maybe_extract_pitch(
+        src, [{"t": 0.0, "d": 0.5, "w": "hi"}], src / "stems" / "vocals.ogg",
+    )
+    assert out is False
+    assert not (src / "vocal_pitch.json").exists()
+
+
+def test_maybe_extract_pitch_skips_when_no_server(tmp_path, monkeypatch):
+    src = _make_sloppak_with_vocals(tmp_path)
+    # Empty server_url AND no demucs fallback (the _patch_pitch_config default).
+    _patch_pitch_config(monkeypatch, server_url=None)
+
+    out = sloppak_convert._maybe_extract_pitch(
+        src, [{"t": 0.0, "d": 0.5, "w": "hi"}], src / "stems" / "vocals.ogg",
+    )
+    assert out is False
+    assert not (src / "vocal_pitch.json").exists()
+
+
+def test_maybe_extract_pitch_skips_when_remote_returns_empty(tmp_path, monkeypatch):
+    src = _make_sloppak_with_vocals(tmp_path)
+    _patch_pitch_config(monkeypatch)
+    # Stub vocal_pitch.extract_pitch_remote (load_sibling import inside
+    # _maybe_extract_pitch resolves to the top-level vocal_pitch module
+    # since pyproject pythonpath = ['.', 'lib']).
+    import vocal_pitch
+    monkeypatch.setattr(vocal_pitch, "extract_pitch_remote", lambda *a, **kw: [])
+
+    out = sloppak_convert._maybe_extract_pitch(
+        src, [{"t": 0.0, "d": 0.5, "w": "hi"}], src / "stems" / "vocals.ogg",
+    )
+    assert out is False
+    assert not (src / "vocal_pitch.json").exists()
+
+
+def test_maybe_extract_pitch_swallows_remote_failure(tmp_path, monkeypatch):
+    src = _make_sloppak_with_vocals(tmp_path)
+    _patch_pitch_config(monkeypatch)
+
+    def _boom(*a, **kw):
+        raise RuntimeError("CREPE server request failed: connection refused")
+    import vocal_pitch
+    monkeypatch.setattr(vocal_pitch, "extract_pitch_remote", _boom)
+
+    # Must NOT raise — best-effort contract.
+    out = sloppak_convert._maybe_extract_pitch(
+        src, [{"t": 0.0, "d": 0.5, "w": "hi"}], src / "stems" / "vocals.ogg",
+    )
+    assert out is False
+    assert not (src / "vocal_pitch.json").exists()
+
+
+def test_maybe_extract_pitch_writes_file_and_manifest(tmp_path, monkeypatch):
+    src = _make_sloppak_with_vocals(tmp_path)
+    _patch_pitch_config(monkeypatch)
+
+    fake_notes = [
+        {"t": 0.0, "d": 0.5, "midi": 64},
+        {"t": 0.6, "d": 0.4, "midi": 67},
+    ]
+    import vocal_pitch
+    monkeypatch.setattr(vocal_pitch, "extract_pitch_remote", lambda *a, **kw: fake_notes)
+
+    out = sloppak_convert._maybe_extract_pitch(
+        src, [{"t": 0.0, "d": 0.5, "w": "hi"}], src / "stems" / "vocals.ogg",
+    )
+    assert out is True
+
+    pitch_path = src / "vocal_pitch.json"
+    assert pitch_path.exists()
+    payload = _json.loads(pitch_path.read_text(encoding="utf-8"))
+    assert payload == {"version": 1, "notes": fake_notes}
+
+    mf = _yaml.safe_load((src / "manifest.yaml").read_text(encoding="utf-8"))
+    assert mf["vocal_pitch"] == "vocal_pitch.json"
+    assert mf["pitch_extraction"] == {
+        "engine": vocal_pitch.PITCH_EXTRACTION_ENGINE,
+        "model": vocal_pitch.PITCH_EXTRACTION_MODEL,
+        "version": vocal_pitch.PITCH_EXTRACTION_SCHEMA_VERSION,
+    }
+
+
+def test_maybe_extract_pitch_emits_progress_within_slice(tmp_path, monkeypatch):
+    src = _make_sloppak_with_vocals(tmp_path)
+    _patch_pitch_config(monkeypatch)
+
+    # Have the stub call its own progress_cb at 0.5 to verify scaling
+    # into the caller's [base_frac, base_frac+span_frac] slice.
+    def _stub_extract(*args, **kwargs):
+        cb = kwargs["progress_cb"]
+        cb(0.0, "pitch", "start")
+        cb(0.5, "pitch", "mid")
+        return [{"t": 0.0, "d": 0.1, "midi": 60}]
+    import vocal_pitch
+    monkeypatch.setattr(vocal_pitch, "extract_pitch_remote", _stub_extract)
+
+    fracs: list[float] = []
+    def _capture(f, stage, msg):
+        fracs.append(round(f, 4))
+    sloppak_convert._maybe_extract_pitch(
+        src, [{"t": 0.0, "d": 0.1, "w": "x"}], src / "stems" / "vocals.ogg",
+    # Reserve [0.6, 0.8] of the overall progress space for this call.
+        progress_cb=_capture, base_frac=0.6, span_frac=0.2,
+    )
+
+    # Strictly monotonic; first scaled tick at 0.60 (0.0 → base), then
+    # 0.70 (0.5 mid → base + span/2), then the terminal 0.80 flush.
+    assert fracs[0] == 0.6
+    assert 0.7 in fracs
+    assert fracs[-1] == 0.8

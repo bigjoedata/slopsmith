@@ -76,15 +76,21 @@ def extract_pitch_remote(
     need the word text), but we pass the full payload through —
     slimmer to forward what we already have than to project.
 
-    Returns the server's `notes` list verbatim:
-    `[{"t": float, "d": float, "midi": int}, ...]`. Tokens the server
-    couldn't extract a pitch for (silent, sub-threshold confidence,
-    no neighbour to borrow from) are omitted from the response — the
-    output may be shorter than the input lyrics.
+    Returns a normalized `notes` list: each entry is
+    `{"t": float, "d": float, "midi": int}` with `t`/`d` rounded to 3
+    decimals and `midi` coerced to int. Malformed server entries
+    (missing key, non-numeric, wrong type) are skipped rather than
+    propagated. Tokens the server couldn't extract a pitch for
+    (silent, sub-threshold confidence, no neighbour to borrow from)
+    are omitted from the response — the output may be shorter than
+    the input lyrics.
 
     Errors raise `RuntimeError` with a truncated server response so
     the caller can log+continue without bringing down the surrounding
-    transcription / split job. Matches the failure idiom in
+    transcription / split job. Transport-level failures
+    (`requests.RequestException`: connection, DNS, timeout, upload
+    aborted) are wrapped here so callers see one exception type, not
+    requests' hierarchy. Matches the failure idiom in
     `transcribe_vocals_remote` and `_run_demucs_remote`."""
     import requests
 
@@ -101,14 +107,20 @@ def extract_pitch_remote(
 
     # The /pitch endpoint validates each entry has numeric `t` + `d`;
     # the `w` field is ignored server-side but harmless to forward.
-    with open(vocals_path, "rb") as f:
-        resp = requests.post(
-            f"{server_url}/pitch",
-            files={"file": (vocals_path.name, f, "audio/ogg")},
-            data={"lyrics": json.dumps(lyrics)},
-            headers=headers or None,
-            timeout=timeout,
-        )
+    # Wrap the upload so a connection / DNS / timeout failure becomes a
+    # RuntimeError instead of leaking requests' own exception hierarchy
+    # past the docstring contract.
+    try:
+        with open(vocals_path, "rb") as f:
+            resp = requests.post(
+                f"{server_url}/pitch",
+                files={"file": (vocals_path.name, f, "audio/ogg")},
+                data={"lyrics": json.dumps(lyrics)},
+                headers=headers or None,
+                timeout=timeout,
+            )
+    except requests.RequestException as e:
+        raise RuntimeError(f"CREPE server request failed: {e}") from e
 
     if resp.status_code != 200:
         raise RuntimeError(

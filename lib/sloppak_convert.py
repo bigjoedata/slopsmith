@@ -1148,14 +1148,36 @@ def _maybe_transcribe_lyrics(
                 pass
         return _skip(f"Failed to write lyrics: {e}")
 
-    _progress(progress_cb, base_frac + span_frac, "transcribing",
+    # Reserve a sub-slice of our span for pitch extraction so the
+    # UI / log progress bar doesn't pin at 100% while CREPE is still
+    # uploading + running server-side. Lyric transcription owns the
+    # first chunk, pitch the tail. The actual slice fraction is
+    # arbitrary; 30% for pitch reflects that upload + remote inference
+    # is typically faster than WhisperX alignment but still
+    # user-visible.
+    _LYRIC_PORTION = 0.7
+    lyric_done_frac = base_frac + span_frac * _LYRIC_PORTION
+    pitch_base = lyric_done_frac
+    pitch_span = base_frac + span_frac - lyric_done_frac
+
+    _progress(progress_cb, lyric_done_frac, "transcribing",
               f"Wrote {len(lyrics)} lyric tokens")
     log.info("_maybe_transcribe_lyrics: wrote %d tokens to %s", len(lyrics), lyrics_path)
 
     # Karaoke pitch extraction is the natural next step now that we
     # have BOTH a vocal stem AND syllable-level lyric timings. Best-
     # effort: failures must not undo the lyric write we just persisted.
-    _maybe_extract_pitch(source_dir, lyrics, vocals_path)
+    _maybe_extract_pitch(
+        source_dir, lyrics, vocals_path,
+        progress_cb=progress_cb,
+        base_frac=pitch_base,
+        span_frac=pitch_span,
+    )
+    # Flush to the top of our reserved slice regardless of whether
+    # pitch ran, so the caller's progress bar always reaches the
+    # boundary the wrapper promised.
+    _progress(progress_cb, base_frac + span_frac, "transcribing",
+              "Lyric + pitch pass complete")
     return True
 
 
@@ -1197,6 +1219,10 @@ def _maybe_extract_pitch(
     source_dir: Path,
     lyrics: list[dict],
     vocals_path: Path,
+    *,
+    progress_cb: ProgressCB = None,
+    base_frac: float = 0.0,
+    span_frac: float = 0.0,
 ) -> bool:
     """Per-syllable pitch extraction via the demucs server's /pitch endpoint.
 
@@ -1208,22 +1234,35 @@ def _maybe_extract_pitch(
       4. A server URL is configured (either `pitch_extraction.server_url`
          or the shared `demucs_server_url`). Local CREPE is deferred.
 
+    `progress_cb` / `base_frac` / `span_frac` mirror the same slice
+    contract as `_maybe_transcribe_lyrics`: emit progress inside the
+    range `[base_frac, base_frac + span_frac]`. Defaults to a
+    zero-width slice so direct callers (tests, retroactive CLI) can
+    invoke without progress bookkeeping.
+
     On success writes `vocal_pitch.json` (shape matches what
     byrongamatos/slopsmith-plugin-lyrics-karaoke renders:
     `{"version": 1, "notes": [{"t","d","midi"}, ...]}`) and adds
     `vocal_pitch` + `pitch_extraction` keys to the manifest. On any
     failure logs a warning and returns False — must NOT undo the
     lyric write the surrounding transcription path already persisted."""
+    def _flush_skip(reason: str) -> bool:
+        # Mirror _maybe_transcribe_lyrics._skip — push the progress bar
+        # to the top of our reserved slice on early-exit so callers
+        # don't pin short of the boundary.
+        _progress(progress_cb, base_frac + span_frac, "pitch", reason)
+        return False
+
     cfg = _get_pitch_config()
     if not cfg["enabled"]:
         log.debug("_maybe_extract_pitch: pitch_extraction.enabled=False — skipping")
-        return False
+        return _flush_skip("Pitch extraction disabled")
     if not lyrics:
         log.debug("_maybe_extract_pitch: no lyrics — nothing to time pitch against")
-        return False
+        return _flush_skip("No lyrics to time pitch against")
     if not vocals_path.exists():
         log.debug("_maybe_extract_pitch: vocals stem missing — skipping")
-        return False
+        return _flush_skip("Vocals stem missing")
 
     # Server URL precedence: explicit pitch_extraction.server_url first,
     # else fall back to the shared demucs server (which hosts /pitch
@@ -1233,7 +1272,7 @@ def _maybe_extract_pitch(
         log.info("_maybe_extract_pitch: no server configured "
                  "(pitch_extraction.server_url / demucs_server_url) — skipping. "
                  "Local CREPE fallback not yet implemented.")
-        return False
+        return _flush_skip("No pitch server configured")
 
     try:
         from vocal_pitch import (
@@ -1244,20 +1283,30 @@ def _maybe_extract_pitch(
         )
     except ImportError as e:
         log.warning("_maybe_extract_pitch: vocal_pitch import failed: %s", e)
-        return False
+        return _flush_skip(f"vocal_pitch import failed: {e}")
+
+    # Scale extract_pitch_remote's internal 0..1 progress into our
+    # reserved slice so the overall progress bar advances smoothly
+    # through upload + inference, rather than waiting until the call
+    # returns to jump.
+    def _scaled_progress(frac: float, stage: str, msg: str) -> None:
+        clamped = max(0.0, min(1.0, frac))
+        _progress(progress_cb, base_frac + span_frac * clamped, stage, msg)
 
     try:
         notes = extract_pitch_remote(
-            vocals_path, lyrics, server_url, api_key=cfg["api_key"],
+            vocals_path, lyrics, server_url,
+            api_key=cfg["api_key"],
+            progress_cb=_scaled_progress,
         )
     except Exception as e:
         log.warning("_maybe_extract_pitch: pitch extraction failed for %s: %s",
                     source_dir.name, e, exc_info=True)
-        return False
+        return _flush_skip(f"Pitch extraction failed: {e}")
 
     if not notes:
         log.info("_maybe_extract_pitch: %s produced no notes", source_dir.name)
-        return False
+        return _flush_skip("No pitch notes produced")
 
     pitch_path = source_dir / "vocal_pitch.json"
     pitch_payload = {"version": 1, "notes": notes}
@@ -1281,8 +1330,10 @@ def _maybe_extract_pitch(
                 pitch_path.unlink()
             except OSError:
                 pass
-        return False
+        return _flush_skip(f"Failed to write pitch: {e}")
 
+    _progress(progress_cb, base_frac + span_frac, "pitch",
+              f"Wrote {len(notes)} pitch notes")
     log.info("_maybe_extract_pitch: wrote %d notes to %s", len(notes), pitch_path)
     return True
 

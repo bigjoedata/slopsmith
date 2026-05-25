@@ -49,23 +49,104 @@ def test_note_with_every_technique_round_trip():
     assert note_from_wire(note_to_wire(n)) == n
 
 
-def test_note_link_next_is_not_round_tripped():
-    """link_next is deliberately omitted from the wire format.
+def test_note_link_next_round_trips_through_wire():
+    """link_next survives the wire under key `ln`.
 
-    Acknowledged behavior, not a regression — chord linking is derived elsewhere.
-    Pinning this so nobody "fixes" it accidentally and breaks downstream assumptions.
+    Originally omitted because the highway derived chord linking from
+    proximity rather than the linkNext attribute. The editor now needs
+    round-trip fidelity so an authored linkNext on a sloppak survives
+    save → reload; `ln` is additive metadata the renderer is free to
+    ignore.
     """
     n = Note(time=0.0, string=0, fret=0, link_next=True)
-    assert note_to_wire(n) == {
-        "t": 0.0, "s": 0, "f": 0, "sus": 0.0,
-        "sl": -1, "slu": -1, "bn": 0,
-        "ho": False, "po": False,
-        "hm": False, "hp": False,
-        "pm": False, "mt": False,
-        "vb": False,
-        "tr": False, "ac": False, "tp": False,
-    }
-    assert note_from_wire(note_to_wire(n)).link_next is False
+    wire = note_to_wire(n)
+    assert wire["ln"] is True
+    assert note_from_wire(wire).link_next is True
+
+
+def test_note_new_techniques_round_trip():
+    """fret_hand_mute, pluck, slap, right_hand, pick_direction, ignore.
+
+    Pin the public wire keys (`fhm`, `plk`, `slp`, `rh`, `pkd`, `ig`)
+    explicitly — a coordinated rename in both encoder and decoder would
+    still pass a pure round-trip check, but break sloppak readers in
+    other languages that key off the literal strings.
+    """
+    n = Note(
+        time=0.0, string=0, fret=0,
+        fret_hand_mute=True, pluck=True, slap=True,
+        right_hand=2, pick_direction=1, ignore=True,
+        link_next=True,
+    )
+    wire = note_to_wire(n)
+    assert wire["ln"] is True
+    assert wire["fhm"] is True
+    assert wire["plk"] is True
+    assert wire["slp"] is True
+    assert wire["rh"] == 2
+    assert wire["pkd"] == 1
+    assert wire["ig"] is True
+    assert note_from_wire(wire) == n
+
+
+def test_note_new_techniques_omitted_when_default():
+    """New technique keys (ln/fhm/plk/slp/rh/pkd/ig) are default-omitted.
+
+    The highway streams notes thousands of times per song; always emitting
+    seven extra boolean/int keys per note would inflate the WebSocket
+    payload for the common case where these techniques are unset.
+    `note_from_wire` decodes missing keys to their dataclass defaults
+    (False / -1), so the round-trip is lossless.
+    """
+    wire = note_to_wire(Note(time=0.0, string=0, fret=0))
+    for omitted in ("ln", "fhm", "plk", "slp", "rh", "pkd", "ig"):
+        assert omitted not in wire, f"{omitted!r} should be default-omitted"
+    decoded = note_from_wire(wire)
+    assert decoded.link_next is False
+    assert decoded.fret_hand_mute is False
+    assert decoded.pluck is False
+    assert decoded.slap is False
+    assert decoded.right_hand == -1
+    assert decoded.pick_direction == -1
+    assert decoded.ignore is False
+
+
+def test_note_from_wire_tolerates_malformed_optional_ints():
+    """`rh`/`pkd` survive null / empty / non-numeric wire values."""
+    for bad in (None, "", "  ", "x", "inf"):
+        n = note_from_wire({"t": 0.0, "s": 0, "f": 0, "rh": bad, "pkd": bad})
+        assert n.right_hand == -1
+        assert n.pick_direction == -1
+
+
+def test_int_optional_falls_back_on_overflow():
+    """`inf` / `1e309` raise OverflowError on int(float(v)); fall back too."""
+    from xml.etree import ElementTree as ET
+    from song import _int_optional
+    el = ET.fromstring('<n a="inf" b="1e309" c="-inf"/>')
+    assert _int_optional(el, "a", default=-1) == -1
+    assert _int_optional(el, "b", default=-1) == -1
+    assert _int_optional(el, "c", default=-1) == -1
+
+
+def test_parse_note_falls_back_to_default_on_malformed_numeric_attrs():
+    """Malformed numeric XML attributes degrade gracefully.
+
+    Third-party Rocksmith XML occasionally emits empty / non-numeric
+    values for fields like `rightHand`. `_int_optional` (used for
+    optional metadata fields like `rightHand` and `pickDirection`)
+    falls back to the caller's default instead of raising, so a
+    malformed `<note>` no longer aborts the surrounding arrangement
+    parse. Required readers still go through `_int` and fail fast.
+    """
+    from xml.etree import ElementTree as ET
+    from song import _parse_note
+    bad = ET.fromstring(
+        '<note time="0.0" string="0" fret="0" rightHand="" pickDirection="x"/>'
+    )
+    n = _parse_note(bad)
+    assert n.right_hand == -1
+    assert n.pick_direction == -1
 
 
 def test_note_time_rounded_to_three_decimals():
@@ -332,6 +413,54 @@ def test_phrase_wire_is_json_safe():
     # allow_nan=False rejects Infinity/NaN — which JS JSON.parse
     # also rejects. Keeps the wire strictly browser-compatible.
     assert json.loads(json.dumps(wire, allow_nan=False)) == wire
+
+
+# ── tones wire round-trip ─────────────────────────────────────────────────────
+
+def test_arrangement_tones_round_trip():
+    tones = {
+        "base": "Clean",
+        "changes": [{"t": 12.5, "name": "Drive"}],
+        "definitions": [{"Name": "Clean", "Key": "Tone_A", "GearList": {}}],
+    }
+    arr = Arrangement(name="Lead", tones=tones)
+    wire = arrangement_to_wire(arr)
+    assert wire["tones"] == tones
+    assert arrangement_from_wire(wire).tones == tones
+
+
+def test_arrangement_without_tones_omits_wire_key():
+    wire = arrangement_to_wire(Arrangement(name="Lead"))
+    assert "tones" not in wire
+    assert arrangement_from_wire(wire).tones is None
+
+
+def test_arrangement_from_wire_ignores_non_dict_tones():
+    # A malformed `tones` value must not crash the loader.
+    assert arrangement_from_wire({"name": "Lead", "tones": []}).tones is None
+
+
+def test_arrangement_tones_wire_is_json_safe():
+    # `definitions` is copied verbatim from the PSARC manifest — the wire
+    # output must still be strict JSON (allow_nan=False, as the browser's
+    # JSON.parse requires).
+    arr = Arrangement(name="Lead", tones={
+        "base": "Clean",
+        "changes": [{"t": 12.5, "name": "Drive"}],
+        "definitions": [{
+            "Name": "Clean", "Key": "Tone_A",
+            "GearList": {"Amp": {"Type": "Amp_Twin",
+                                 "KnobValues": {"Gain": 45.5}}},
+        }],
+    })
+    wire = arrangement_to_wire(arr)
+    assert json.loads(json.dumps(wire, allow_nan=False)) == wire
+
+
+def test_arrangement_from_wire_empty_tones_dict_becomes_none():
+    # An empty `{}` normalizes to None, symmetric with arrangement_to_wire
+    # only emitting the key when arr.tones is truthy.
+    assert arrangement_from_wire({"name": "Lead", "tones": {}}).tones is None
 
 
 # ── Dataclass defaults ───────────────────────────────────────────────────────

@@ -29,7 +29,7 @@ tests/
 
 ## Plugin System
 
-Plugins are the primary extension point. Each plugin lives in `plugins/<name>/` with a `plugin.json` manifest:
+Plugins are the primary extension point. Each plugin lives in `plugins/<name>/` with a `plugin.json` manifest. Plugins are typically their own git repositories — see [CONTRIBUTING.md](CONTRIBUTING.md) for the licensing policy (curated plugins should be AGPL-3.0 or AGPL-compatible: MIT, BSD, Apache-2.0).
 
 ```json
 {
@@ -84,6 +84,9 @@ Best practices:
 - `get_dlc_dir()` — returns the DLC folder Path
 - `extract_meta()` — metadata extraction callable
 - `meta_db` — shared MetadataDB instance
+- `library_providers` — shared library provider registry for source-aware browsing
+- `register_library_provider(provider)` — register a plugin-provided library source. Providers expose `id`, `label`, optional `kind`/`capabilities`, and callable `query_page`, `query_artists`, `query_stats`, and `tuning_names` methods. Providers with `art.read` may also expose `get_art(song_id)` returning one of: a `Response` object (any media type, served as-is); raw `bytes` or `bytearray` (**assumed PNG** — use a `Response` or a `dict` with `content`+`media_type` keys for JPEG/WebP or other formats); a URL string (http/https → 302 redirect; other schemes are rejected with 400); a filesystem path string or `Path` (served as a file with auto-detected media type); or a `dict` with a `url`, `path`, or `content` key. Providers with `song.sync` may expose `sync_song(song_id)` returning `None` (success with no local file) or a `dict` — the dict is passed through as the JSON response and should include `filename`/`local_filename` if a local playable file was produced.
+- `unregister_library_provider(provider_id)` — remove a plugin-provided library source by id. The built-in `local` provider cannot be removed.
 - `get_sloppak_cache_dir()` — sloppak cache path
 - `load_sibling(name)` — loads a sibling module from this plugin's directory under a unique, namespaced module name. See "Sibling imports" below.
 - `log` — stdlib `logging.Logger` namespaced to `slopsmith.plugin.<id>`. Pre-configured with the app-wide level, format (including JSON mode), and correlation IDs. Use this for all backend plugin output instead of `print()`. See "Backend plugin logging" below.
@@ -245,6 +248,8 @@ window.slopsmithViz_piano.matchesArrangement = function (songInfo) {
 - First match wins (picker order), so the registration order of plugins is the tiebreaker. Keep predicates narrow to avoid stealing songs from more specialized viz.
 
 **WebGL viz in Auto mode.** Auto evaluation runs on every `song:ready` regardless of which renderer is active. Auto-installing a WebGL renderer when the canvas is currently 2D — or reverting from a WebGL Auto pick to the default 2D — works without a reload because `setRenderer` swaps the canvas element when `contextType` differs (see "Canvas context-type swapping" above). WebGL viz can therefore safely declare `matchesArrangement` and rely on Auto. For 3D Highway specifically, `_canRun3D()` in app.js still gates Auto from picking it on machines without WebGL2 — that fallback is independent of canvas swapping.
+
+**Optional factory statics for host plugins.** A host plugin with renderer-specific per-panel UI may read optional statics attached to a viz factory. For example, `factory.panelControls` can expose host-readable metadata describing a curated control surface for that renderer. Treat this as opt-in metadata for hosts that know about it; the core setRenderer contract does not require or consume `panelControls`.
 
 #### 2. Overlay contract — for add-on layers
 
@@ -500,7 +505,7 @@ Full developer reference (workflow recipes, harness flag table, diagnostic schem
 ## Versioning
 
 - **`VERSION`** (repo root) — single source of truth; plain semver string (e.g. `0.2.4`). Bind-mounted into the container and copied by the Dockerfile so it's always available at `/app/VERSION`.
-- **`GET /api/version`** — returns `{"version": "<contents of VERSION>"}`. Displayed as a badge in the navbar.
+- **`GET /api/version`** — returns `{"version": "<contents of VERSION>", "source_url": "...", "license_url": "..."}`. The version drives the navbar badge; `source_url` / `license_url` populate the Settings → About links. `source_url` is configurable via the `APP_SOURCE_URL` env var (default `https://github.com/byrongamatos/slopsmith`); `license_url` falls back to `source_url + "/blob/main/LICENSE"` (GitHub-style, default branch `main`) and is overridable via the `APP_LICENSE_URL` env var — set it explicitly when the source is hosted on a non-GitHub forge (GitLab/Gitea/self-hosted) or under a non-`main` default branch. Both env values must be `http(s)`; non-http(s) values are rejected and fall back to the safe default to prevent `javascript:`/`data:` hrefs.
 - **Auto-sync** — `.github/workflows/sync-version.yml` rewrites `VERSION` via a `repository_dispatch` (`desktop-released`) fired from `slopsmith-desktop`'s release job. As an explicit automation-only exception to the "Never push directly to main" rule in Git Workflow below, the sync job commits straight to `main` as `github-actions[bot]` (version bumps are mechanical; the PR round-trip adds no signal). Human contributors must still go through feature branches + PRs. No manual VERSION edits needed. Use the workflow's `workflow_dispatch` trigger with `version: X.Y.Z` for manual runs (recovery / out-of-band bumps).
 - **`CHANGELOG.md`** — follows [Keep a Changelog](https://keepachangelog.com/) format. Update the `[Unreleased]` section with each PR; when `slopsmith-desktop` cuts a release, rename `[Unreleased]` to the new version + date (the VERSION bump itself is automated).
 
@@ -523,7 +528,7 @@ The highway WebSocket at `/ws/highway/{filename}?arrangement={index}` streams th
 | `sections` | `{ type, data: [{ time, name }] }` | Named sections (Intro, Verse, Chorus, etc.) |
 | `anchors` | `{ type, data: [{ time, fret, width }] }` | Fret zoom anchors |
 | `chord_templates` | `{ type, data: [{ name, frets: [6] }] }` | Named chord shapes |
-| `lyrics` | `{ type, data: [{ w, t, d }] }` | Syllables: `w`=word, `t`=time, `d`=duration. `-` joins to previous, `+` = line break |
+| `lyrics` | `{ type, data: [{ w, t, d }], source }` | Syllables: `w`=word, `t`=time, `d`=duration. `-` joins to previous, `+` = line break. `source` is one of `"xml"`, `"sng"`, `"whisperx"`, `"user"` — UI can use it to render an "auto-transcribed" badge for `whisperx`. Sloppaks always include `source` (legacy sloppaks without a `lyrics_source` manifest key default to `"xml"` at load time). PSARC/loose folders set it based on which extractor matched. Absent only when no lyrics fired the message at all |
 | `tone_changes` | `{ type: 'tone_changes', base, data: [{ time, name }] }` | Optional — tone change events relative to the arrangement base tone; only sent if tones were found |
 | `notes` | `{ type, data: [{ t, s, f, sus, ho, po, sl, bn, ... }] }` | Single notes |
 | `chords` | `{ type, data: [{ t, notes: [{ s, f, sus, ... }] }] }` | Chord events |

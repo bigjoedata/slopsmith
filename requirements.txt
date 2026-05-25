@@ -14,3 +14,10 @@ structlog>=24.1.0
 asgi-correlation-id>=4.3.3
 psutil>=5.9.0
 py-cpuinfo>=9.0.0
+yt-dlp>=2025.1.1
+# Used by lib/sloppak_convert.py:_run_demucs_remote and
+# lib/lyrics_transcribe.py:transcribe_vocals_remote to talk to optional
+# remote Demucs / WhisperX servers. Currently transitively pulled by
+# cloudscraper, but declaring it explicitly avoids breakage if that
+# transitive dep ever changes upstream.
+requests>=2.31

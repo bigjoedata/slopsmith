@@ -32,6 +32,12 @@ class Note:
     accent: bool = False
     link_next: bool = False
     tap: bool = False
+    fret_hand_mute: bool = False
+    pluck: bool = False
+    slap: bool = False
+    right_hand: int = -1
+    pick_direction: int = -1
+    ignore: bool = False
 
 
 @dataclass
@@ -127,6 +133,15 @@ class Arrangement:
     # available, disable the slider". Populated from Rocksmith XML when
     # multiple `<level>` tiers exist.
     phrases: list[Phrase] | None = None
+    # Tone data lifted from the source PSARC by the sloppak converter and
+    # carried inline in the arrangement JSON. None for PSARC/loose playback
+    # (the highway reads those tones from the XML directly) and for old
+    # sloppaks predating tone support. Shape:
+    #   {"base": str, "changes": [{"t": float, "name": str}],
+    #    "definitions": [<raw RS tone object>]}
+    # `base`/`changes` drive the highway tone-change markers; `definitions`
+    # feed the Tones plugin gear panel.
+    tones: dict | None = None
 
 
 @dataclass
@@ -143,6 +158,14 @@ class Song:
     audio_path: str = ""
     # Optional lyrics, one entry per syllable: {"t": float, "d": float, "w": str}
     lyrics: list[dict] = field(default_factory=list)
+    # Provenance of the lyrics, when present. One of "xml" | "sng" | "whisperx" |
+    # "user" — surfaces in the highway WS payload so the UI can render a badge
+    # (e.g. "auto-transcribed — may be inaccurate" for whisperx). The sloppak
+    # loader (lib/sloppak.py) defaults missing manifest keys to "xml" at load
+    # time so legacy sloppaks aren't mis-badged; the dataclass default of ""
+    # only persists for sources that build a Song without populating it (e.g.
+    # in-test stubs, the WS path before lyrics have been emitted).
+    lyrics_source: str = ""
 
 
 # ── Wire format serialization (shared between highway_ws and sloppak loader) ──
@@ -152,7 +175,15 @@ class Song:
 # arrangement file format — see `arrangements/*.json` inside a sloppak.
 
 def note_to_wire(n: Note) -> dict:
-    return {
+    # The pre-existing technique keys (ho/po/hm/hp/pm/mt/vb/tr/ac/tp) keep
+    # being emitted unconditionally to preserve the legacy wire-format
+    # contract — older consumers may assume those keys exist. The new
+    # techniques (ln/fhm/plk/slp/rh/pkd/ig) are introduced default-omitted
+    # so the highway's per-note WebSocket payload doesn't inflate for the
+    # common case where they're unset. `note_from_wire` decodes missing
+    # keys to their dataclass defaults, matching the sloppak spec
+    # ("Omit fields equal to their default …").
+    out = {
         "t": round(n.time, 3), "s": n.string, "f": n.fret,
         "sus": round(n.sustain, 3),
         "sl": n.slide_to, "slu": n.slide_unpitch_to,
@@ -163,6 +194,21 @@ def note_to_wire(n: Note) -> dict:
         "vb": n.vibrato,
         "tr": n.tremolo, "ac": n.accent, "tp": n.tap,
     }
+    if n.link_next:
+        out["ln"] = True
+    if n.fret_hand_mute:
+        out["fhm"] = True
+    if n.pluck:
+        out["plk"] = True
+    if n.slap:
+        out["slp"] = True
+    if n.right_hand != -1:
+        out["rh"] = n.right_hand
+    if n.pick_direction != -1:
+        out["pkd"] = n.pick_direction
+    if n.ignore:
+        out["ig"] = True
+    return out
 
 
 def chord_note_to_wire(cn: Note) -> dict:
@@ -209,6 +255,21 @@ def chord_template_to_wire(ct: ChordTemplate) -> dict:
     }
 
 
+def _wire_int_optional(v, default=-1):
+    """Parse optional wire ints; fall back to default on null/blank/invalid."""
+    if v is None:
+        return default
+    if isinstance(v, str) and not v.strip():
+        return default
+    try:
+        return int(v)
+    except (ValueError, TypeError, OverflowError):
+        try:
+            return int(float(v))
+        except (ValueError, TypeError, OverflowError):
+            return default
+
+
 def note_from_wire(d: dict, time: float | None = None) -> Note:
     return Note(
         time=float(d.get("t", time if time is not None else 0.0)),
@@ -228,6 +289,15 @@ def note_from_wire(d: dict, time: float | None = None) -> Note:
         tremolo=bool(d.get("tr", False)),
         accent=bool(d.get("ac", False)),
         tap=bool(d.get("tp", False)),
+        link_next=bool(d.get("ln", False)),
+        fret_hand_mute=bool(d.get("fhm", False)),
+        pluck=bool(d.get("plk", False)),
+        slap=bool(d.get("slp", False)),
+        # Optional integer metadata — graceful-fallback decode, matching
+        # the XML side's `_int_optional`.
+        right_hand=_wire_int_optional(d.get("rh"), -1),
+        pick_direction=_wire_int_optional(d.get("pkd"), -1),
+        ignore=bool(d.get("ig", False)),
     )
 
 
@@ -384,6 +454,12 @@ def arrangement_to_wire(arr: Arrangement) -> dict:
     # see the flat-merge arrangement.
     if arr.phrases:
         out["phrases"] = [phrase_to_wire(p) for p in arr.phrases]
+    # `tones` is additive — only emitted when the source carried tone data
+    # (sloppaks converted from a PSARC). Absent on PSARC/loose-derived
+    # Arrangements and old sloppaks; readers treat a missing key as
+    # "no tones".
+    if arr.tones:
+        out["tones"] = arr.tones
     return out
 
 
@@ -423,6 +499,12 @@ def arrangement_from_wire(d: dict) -> Arrangement:
             [phrase_from_wire(p) for p in d["phrases"]]
             if d.get("phrases") else None
         ),
+        # `tones` is an opaque block written by the converter. An empty dict
+        # normalizes to None ("no tones") — symmetric with
+        # `arrangement_to_wire`, which only emits the key when `arr.tones` is
+        # truthy, and consistent with how `phrases` treats an empty value.
+        # Absent on older sloppaks.
+        tones=(d["tones"] if isinstance(d.get("tones"), dict) and d["tones"] else None),
     )
 
 
@@ -439,6 +521,29 @@ def _int(elem, attr, default=0):
         return int(v)
     except ValueError:
         return int(float(v))
+
+
+def _int_optional(elem, attr, default=-1):
+    """Graceful-fallback integer reader for *optional* XML attributes.
+
+    Use for fields that are merely metadata hints (right-hand fingering,
+    pick direction, etc.) where a malformed value from a third-party
+    Rocksmith XML emitter shouldn't abort the whole arrangement parse.
+
+    Required-field readers (`string`, `fret`, `chordId`, …) keep using
+    `_int` so a corrupted required attribute still fails fast at parse
+    time rather than silently defaulting to a wrong index.
+    """
+    v = elem.get(attr)
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return default
+    try:
+        return int(v)
+    except (ValueError, TypeError, OverflowError):
+        try:
+            return int(float(v))
+        except (ValueError, TypeError, OverflowError):
+            return default
 
 
 _FALSE_LITERALS = frozenset({"", "0", "false", "False", "FALSE"})
@@ -498,6 +603,12 @@ def _parse_note(n) -> Note:
         accent=_bool(n, "accent"),
         link_next=_bool(n, "linkNext"),
         tap=_bool(n, "tap"),
+        fret_hand_mute=_bool(n, "fretHandMute"),
+        pluck=_bool(n, "pluck"),
+        slap=_bool(n, "slap"),
+        right_hand=_int_optional(n, "rightHand", -1),
+        pick_direction=_int_optional(n, "pickDirection", -1),
+        ignore=_bool(n, "ignore"),
     )
 
 
@@ -600,13 +711,38 @@ def parse_arrangement(xml_path: str) -> Arrangement:
         if container is not None:
             for c in container.findall("chord"):
                 t = _float(c, "time")
-                chord_notes = [_parse_note(cn) for cn in c.findall("chordNote")]
+                chord_note_elems = list(c.findall("chordNote"))
+                chord_notes = [_parse_note(cn) for cn in chord_note_elems]
                 cid = _int(c, "chordId")
+                # Chord-level technique flags — propagated to synthetic notes
+                # when there are no <chordNote> children (gallop/repeat strums).
+                _ch_pm  = _bool(c, "palmMute")
+                _ch_mt  = _bool(c, "mute")
+                _ch_acc = _bool(c, "accent")
                 if not chord_notes and cid < len(chord_templates):
                     ct = chord_templates[cid]
                     for s in range(len(ct.frets)):
                         if ct.frets[s] >= 0:
-                            chord_notes.append(Note(time=t, string=s, fret=ct.frets[s]))
+                            chord_notes.append(Note(
+                                time=t, string=s, fret=ct.frets[s],
+                                palm_mute=_ch_pm, mute=_ch_mt,
+                                accent=_ch_acc,
+                            ))
+                elif chord_notes and (_ch_pm or _ch_mt or _ch_acc):
+                    # Propagate chord-level flags to chordNote children that
+                    # don't set them explicitly. `_parse_note` flattens an
+                    # absent attribute and an explicit false literal (`""`,
+                    # `"0"`, `"false"`) to the same False, so peek at the raw
+                    # XML element via `cn_elem.get(...)` to distinguish them
+                    # — an authored `<chordNote palmMute="0">` under a
+                    # `<chord palmMute="1">` parent must keep palm_mute=False.
+                    for cn, cn_elem in zip(chord_notes, chord_note_elems):
+                        if _ch_pm and cn_elem.get("palmMute") is None:
+                            cn.palm_mute = True
+                        if _ch_mt and cn_elem.get("mute") is None:
+                            cn.mute = True
+                        if _ch_acc and cn_elem.get("accent") is None:
+                            cn.accent = True
                 lv_chords.append(Chord(
                     time=t, chord_id=cid, notes=chord_notes,
                     high_density=_chord_high_density(c),

@@ -2,6 +2,8 @@
 
 Sloppak is Slopsmith's open, hand-editable song format. This guide is for developers who want to **read**, **write**, or **extend** the format — including adding new data types like drum tabs, vocal pitches, lighting cues, key/scale annotations, or anything else a future visualization plugin might need.
 
+> If you're a **user** wanting to modify an existing sloppak — record your own rhythm stem, fix metadata, swap cover art, replace a Demucs split — see [sloppak-hand-editing.md](sloppak-hand-editing.md). That guide is the practical, step-by-step companion to this developer reference.
+
 The authoritative format reference lives in code (`lib/sloppak.py`, `lib/song.py`); this doc explains the why, the how, and the conventions you should follow when adding to it.
 
 ---
@@ -77,6 +79,8 @@ Full set of currently-recognized top-level keys:
 | `arrangements` | list | yes | Playable arrangements (see §2.1) |
 | `stems` | list | yes | Audio stems (see §2.2) |
 | `lyrics` | string | no | Path to lyrics JSON |
+| `lyrics_source` | string | no | Where the lyrics came from: `xml` (Rocksmith vocals.xml), `sng` (encrypted Rocksmith vocals.sng), `whisperx` (auto-transcribed), or `user` (hand-edited). Absent on legacy sloppaks — readers should treat missing as `xml` |
+| `lyric_transcription` | object | no | Structured metadata when lyrics came from an automated engine (currently `whisperx`). Same shape as the parent `stem_separation` block defined by [slopsmith#357](https://github.com/byrongamatos/slopsmith/issues/357) — see §2.3 for fields and semver semantics. Omitted for authored lyrics (`xml`/`sng`/`user`) |
 | `cover` | string | no | Path to cover image |
 
 Unknown keys are **silently ignored** by the loader. This is deliberate — it's the extensibility hook (see §5).
@@ -133,7 +137,25 @@ If present, points at a JSON file containing a flat list of syllable objects:
 |---|---|
 | `t` | Time in seconds |
 | `d` | Duration in seconds |
-| `w` | Syllable text. `-` suffix joins to next word; `+` is a line break sentinel |
+| `w` | Syllable text. Trailing `-` joins to the next syllable as one word; trailing `+` marks the last syllable of a line (renderer wraps after it). Both are suffixes on a real syllable — not standalone entries. See `static/highway.js` for the rendering: `raw.endsWith('+')` flags end-of-line, and `sylText` strips the trailing marker before drawing |
+
+When lyrics are present, the optional top-level `lyrics_source` key records where they came from. The PSARC→sloppak converter sets it to `xml` or `sng` based on which Rocksmith source it parsed; the WhisperX auto-transcription fallback (`scripts/transcribe_lyrics.py`, or `--auto-lyrics` on the convert / split scripts) sets it to `whisperx`. Hand-edited lyrics should bump it to `user` so UI consumers can render a different badge (or no badge) than for machine-generated lyrics. The key is absent on sloppaks produced before this field existed — readers should treat missing as `xml` for backward compatibility.
+
+When `lyrics_source` is `whisperx` (or any future automated engine), an optional `lyric_transcription` block records which engine + model produced the file. Shape mirrors the parent `stem_separation` RFC ([slopsmith#357](https://github.com/byrongamatos/slopsmith/issues/357)):
+
+```yaml
+lyric_transcription:
+  engine: whisperx     # stable engine id
+  model: medium        # the WhisperX model size that ran (tiny/base/small/medium/large-v2/large-v3)
+  version: 1.0.0       # semver for slopsmith's lyric-transcription artifact contract
+```
+
+Fields:
+- `engine` — stable identifier for the transcription engine; currently always `whisperx`.
+- `model` — the engine-specific model id used for this transcription.
+- `version` — semver for Slopsmith's lyric-transcription artifact contract (independent of upstream Whisper / WhisperX versions). Bump per the same semantics #357 defines for stems: patch = metadata-only fixes, minor = backward-compatible additions, major = output shape changed and existing transcriptions should be regenerated.
+
+Omitted for authored lyrics (`xml` / `sng` / `user`). A remote WhisperX server can use this block as part of a cache key the same way #357 envisions for stems — caches should miss whenever any of the three fields change, ensuring stale transcriptions don't get returned after a model bump.
 
 ---
 
@@ -159,6 +181,7 @@ The authoritative serializer/deserializer is in [lib/song.py](../lib/song.py):
   "handshapes": [ /* see 3.5 */ ],
   "templates":  [ /* see 3.6 */ ],
   "phrases":    [ /* optional, see 3.7 */ ],
+  "tones":      { /* optional, see 3.9 */ },
   "beats":      [ /* see 3.8, only on first arrangement */ ],
   "sections":   [ /* see 3.8, only on first arrangement */ ]
 }
@@ -188,11 +211,18 @@ Field names are short on purpose — these get streamed thousands of times per s
   "vb": false,    // vibrato
   "tr": false,    // tremolo
   "ac": false,    // accent
-  "tp": false     // tap
+  "tp": false,    // tap
+  "ln": false,    // link-next (chord linking metadata; renderers may ignore — runtime linking is derived from proximity)
+  "fhm": false,   // fret-hand mute
+  "plk": false,   // pluck (pop, bass)
+  "slp": false,   // slap (bass)
+  "rh": -1,       // right-hand fingering (-1 = unset)
+  "pkd": -1,      // pick direction (-1 = unset, 0 = down, 1 = up)
+  "ig": false     // ignore (chart-author flag — note is rendered but not scored / sequenced)
 }
 ```
 
-Default values: numbers → `0` or `-1` (slides), bools → `false`. Omit fields equal to their default if you're authoring by hand — the parser fills them in.
+Default values: numbers → `0` or `-1` (slides / `rh` / `pkd`), bools → `false`. Omit fields equal to their default if you're authoring by hand — the parser fills them in. **Encoders should default-omit the newer technique keys** (`ln`, `fhm`, `plk`, `slp`, `rh`, `pkd`, `ig`) — the highway streams notes thousands of times per song, so trimming the common case keeps the WebSocket payload tight. The pre-existing keys are still emitted unconditionally to preserve the legacy wire contract.
 
 ### 3.3. Chords
 
@@ -283,6 +313,33 @@ If you're writing a converter that doesn't have multi-difficulty data, **omit th
 
 `measure: -1` = sub-beat (not a downbeat). Section `name` follows Rocksmith conventions (`intro`, `verse`, `chorus`, `bridge`, `solo`, `outro`, …).
 
+### 3.9. Tones (optional)
+
+`tones` carries the arrangement's guitar tones — the amp/pedal/cabinet gear and the in-song tone switches. It's written by the PSARC→sloppak converter (`lib/tones.py`); a sloppak authored from scratch may omit it entirely.
+
+```json
+"tones": {
+  "base": "Clean Rhythm",
+  "changes": [
+    {"t": 12.5, "name": "Lead Drive"},
+    {"t": 48.0, "name": "Clean Rhythm"}
+  ],
+  "definitions": [
+    {
+      "Name": "Clean Rhythm",
+      "Key": "Tone_A",
+      "GearList": { /* raw Rocksmith gear blocks: Amp, PrePedal1-4, … */ }
+    }
+  ]
+}
+```
+
+- `base` (string) — the tone in effect before the first change.
+- `changes` (list, time-sorted) — `{"t": seconds, "name": str}` tone switches. The highway draws a marker at each. Omit when the arrangement never switches tone.
+- `definitions` (list) — the **raw Rocksmith tone objects** (`Name`, `Key`, `GearList`), copied verbatim from the source PSARC manifest. The Tones plugin parses these into the rendered signal chain (it owns the gear-name/image map, so the data is stored unparsed here).
+
+All three sub-keys are individually optional; an arrangement with none of them simply omits `tones`. Readers that don't know about tones ignore the key (the loader preserves it verbatim).
+
 ---
 
 ## 4. Reading and writing sloppaks programmatically
@@ -368,21 +425,31 @@ Older Slopsmith readers ignore the unknown `drum_tab` key (the loader uses `mani
 
 #### Drum tab
 
-`drum_tab.json` containing per-piece hits:
+`drum_tab.json` carries per-piece hits authored on top of the song's audio.
+Implemented end-to-end as of slopsmith#344 (drums-from-scratch): the loader
+in `lib/sloppak.py` parses it, `lib/drums.py` defines the canonical piece-id
+vocabulary, and `/ws/highway/{filename}` streams it as `drum_tab` + chunked
+`drum_hits` messages.
 
 ```json
 {
   "version": 1,
+  "name": "Drums",
   "kit": [
-    {"id": "kick",    "name": "Kick"},
-    {"id": "snare",   "name": "Snare"},
-    {"id": "hh_open", "name": "Hi-hat (open)"},
-    {"id": "ride",    "name": "Ride"}
+    {"id": "kick",      "name": "Kick"},
+    {"id": "snare",     "name": "Snare"},
+    {"id": "hh_closed", "name": "Hi-hat (closed)"},
+    {"id": "hh_open",   "name": "Hi-hat (open)"},
+    {"id": "crash_r",   "name": "Crash (right)"},
+    {"id": "ride",      "name": "Ride"}
   ],
   "hits": [
-    {"t": 0.500, "p": "kick",  "v": 100},
-    {"t": 0.750, "p": "snare", "v":  88},
-    {"t": 1.000, "p": "hh_open"}
+    {"t": 0.500, "p": "kick",      "v": 110},
+    {"t": 0.750, "p": "snare",     "v":  92},
+    {"t": 0.750, "p": "hh_closed", "v":  70},
+    {"t": 1.000, "p": "snare",     "v":  60, "g": true},
+    {"t": 1.250, "p": "snare",     "v": 105, "f": true},
+    {"t": 4.000, "p": "crash_r",   "v": 120, "k": 0.080}
   ]
 }
 ```
@@ -393,10 +460,70 @@ Manifest:
 drum_tab: drum_tab.json
 ```
 
-Notes on the design:
-- `kit[]` is the legend (which piece IDs exist) — separates fixed metadata from hot-path data.
-- `hits[]` uses short field names (`t`, `p`, `v`) since this list can be thousands long.
-- `v` (velocity) is optional, defaults to 100 — keeps simple charts terse.
+##### Hit fields
+
+| key | type | meaning |
+| --- | --- | --- |
+| `t` | float seconds | hit time, required, monotonic in `hits[]` |
+| `p` | string | piece-id from the closed list below; required |
+| `v` | int 1-127 | velocity (default 100) |
+| `g` | bool | ghost note (renders smaller / outline-only) |
+| `f` | bool | flam (renders a small leading ghost glyph 30 ms early) |
+| `k` | float seconds | cymbal-choke tail duration (renders a fade-out) |
+
+##### Canonical piece-id vocabulary
+
+A closed list lives in `lib/drums.py::PIECES`. Open/closed hi-hat are
+**distinct piece-ids**, not articulation flags — hit detection must reject
+a closed-hat strike on an open-hat note, which it can only do if the
+articulation is part of the piece-id.
+
+| piece-id | category | default GM MIDI | default shape |
+| --- | --- | --- | --- |
+| `kick` | kick | 35, 36 | bar (full-width across all non-kick lanes) |
+| `snare` | drum | 38, 40 | rectangle |
+| `snare_xstick` | drum | 37 | hatched rectangle |
+| `tom_hi` | drum | 50, 48 | rectangle |
+| `tom_mid` | drum | 47, 45 | rectangle |
+| `tom_low` | drum | 43 | rectangle |
+| `tom_floor` | drum | 41 | rectangle |
+| `hh_closed` | cymbal | 42 | filled circle |
+| `hh_open` | cymbal | 46 | ring (outline) circle |
+| `hh_pedal` | cymbal | 44 | small circle with × |
+| `stack` | cymbal | 30 | jagged circle (no GM standard — reuses 30 from extended-percussion range) |
+| `crash_l` | cymbal | 49 | circle |
+| `crash_r` | cymbal | 57 | circle |
+| `splash` | cymbal | 55 | small circle |
+| `china` | cymbal | 52 | jagged circle |
+| `ride` | cymbal | 51, 59 | circle |
+| `ride_bell` | cymbal | 53 | circle with centre dot |
+| `bell` | cymbal | 80 | circle with centre dot (no GM standard — reuses "Mute Triangle") |
+
+Unknown piece-ids round-trip through the loader (forward-compat); the
+client just renders them as a default rectangle.
+
+##### Wire format
+
+Streamed as two highway-WS message types:
+
+```json
+{ "type": "drum_tab", "version": 1, "name": "Drums",
+  "kit": [{"id": "kick", "name": "Kick"}, ...], "total": 1234 }
+```
+
+…followed by one or more chunks of 500 hits:
+
+```json
+{ "type": "drum_hits", "data": [{"t": 0.5, "p": "kick", "v": 110}, ...],
+  "total": 1234 }
+```
+
+##### Design notes
+
+- `kit[]` is the legend — fixed metadata, separated from hot-path data.
+- `hits[]` uses short field names because this list can be thousands long.
+- `v` defaults to 100; ghost / flam / choke flags are all optional.
+- Older sloppaks whose drums are encoded as guitar notes (`midi = string*24 + fret`) still play — the drums plugin keeps a legacy decoder that reads the standard `notes` stream and synthesises `drum_hits` from it.
 
 #### Key / scale annotations (for theory-aware visualizations)
 

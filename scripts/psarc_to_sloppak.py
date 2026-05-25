@@ -40,7 +40,7 @@ import yaml  # noqa: E402
 
 from patcher import unpack_psarc  # noqa: E402
 from song import load_song, arrangement_to_wire  # noqa: E402
-from audio import find_wem_files, _vgmstream_cmd, _ffmpeg_cmd  # noqa: E402
+from audio import find_wem_files, _vgmstream_cmd, _ffmpeg_cmd, _ffmpeg_wav_to_ogg  # noqa: E402
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -84,34 +84,27 @@ def _wem_to_ogg(wem_path: str, out_ogg: Path) -> None:
             )
 
         out_ogg.parent.mkdir(parents=True, exist_ok=True)
-        r2 = subprocess.run(
-            [ffmpeg, "-y", "-i", str(wav), "-c:a", "libvorbis", "-q:a", "5", str(out_ogg)],
-            capture_output=True,
-        )
+        # Shared helper handles the libvorbis → built-in vorbis fallback
+        # when the host ffmpeg was built without --enable-libvorbis.
+        r2 = _ffmpeg_wav_to_ogg(ffmpeg, wav, out_ogg)
         if r2.returncode != 0 or not out_ogg.exists() or out_ogg.stat().st_size < 100:
             raise RuntimeError(
                 f"ffmpeg OGG encode failed: {r2.stderr.decode(errors='replace')}"
             )
 
 
-def _parse_lyrics(extracted_dir: Path) -> list[dict]:
-    """Return compact-wire lyric tokens from any vocals XML in the extract."""
-    for xml_path in sorted(extracted_dir.rglob("*.xml")):
-        try:
-            root = ET.parse(xml_path).getroot()
-        except Exception:
-            continue
-        if root.tag != "vocals":
-            continue
-        out: list[dict] = []
-        for v in root.findall("vocal"):
-            out.append({
-                "t": round(float(v.get("time", "0")), 3),
-                "d": round(float(v.get("length", "0")), 3),
-                "w": v.get("lyric", ""),
-            })
-        return out
-    return []
+def _parse_lyrics_with_source(extracted_dir: Path) -> tuple[list[dict], str | None]:
+    """Return (lyric tokens, provenance) from vocals XML OR SNG in the extract.
+
+    Delegates to the library implementation (`lib/sloppak_convert.py`)
+    so this script stays in lockstep with it — official DLC ships
+    vocals only in SNG form, and an XML-only parse would falsely
+    report "no lyrics" on those PSARCs, which would in turn make the
+    --auto-lyrics flag transcribe over the real authored lyrics. The
+    lib version also handles platform routing (PC vs Mac SNG keys)
+    and returns the `lyrics_source` provenance the manifest expects."""
+    from sloppak_convert import _parse_lyrics_with_source as _lib
+    return _lib(extracted_dir)
 
 
 def _extract_cover(extracted_dir: Path, out_jpg: Path) -> bool:
@@ -202,10 +195,10 @@ def convert(psarc_path: Path, out_path: Path, as_dir: bool) -> Path:
         ]
 
         # Lyrics.
-        lyrics = _parse_lyrics(tmp_extract)
+        lyrics, lyrics_source = _parse_lyrics_with_source(tmp_extract)
         lyrics_rel = None
         if lyrics:
-            print(f"[*] Writing {len(lyrics)} lyric tokens")
+            print(f"[*] Writing {len(lyrics)} lyric tokens (source: {lyrics_source})")
             (work_dir / "lyrics.json").write_text(
                 json.dumps(lyrics, separators=(",", ":")), encoding="utf-8"
             )
@@ -231,6 +224,8 @@ def convert(psarc_path: Path, out_path: Path, as_dir: bool) -> Path:
         manifest["arrangements"] = arr_manifest
         if lyrics_rel:
             manifest["lyrics"] = lyrics_rel
+            if lyrics_source:
+                manifest["lyrics_source"] = lyrics_source
 
         (work_dir / "manifest.yaml").write_text(
             yaml.safe_dump(manifest, sort_keys=False, allow_unicode=True),
@@ -251,6 +246,13 @@ def convert(psarc_path: Path, out_path: Path, as_dir: bool) -> Path:
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+def _progress_printer(frac: float, stage: str, msg: str) -> None:
+    sys.stdout.write(f"\r[{stage:>12}] {int(frac * 100):3d}%  {msg:<60}")
+    sys.stdout.flush()
+    if frac >= 1.0:
+        sys.stdout.write("\n")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Convert a PSARC to a .sloppak")
     ap.add_argument("psarc", type=Path, help="input .psarc file")
@@ -258,6 +260,10 @@ def main() -> int:
                     help="output path (default: alongside the PSARC)")
     ap.add_argument("--dir", action="store_true",
                     help="emit directory form instead of a zip")
+    ap.add_argument("--auto-lyrics", dest="auto_lyrics", action="store_true",
+                    help="after conversion, run Demucs + WhisperX to generate "
+                         "lyrics.json from the vocal stem (skipped when the PSARC "
+                         "already shipped lyrics). Adds the split-stems pass too.")
     args = ap.parse_args()
 
     psarc = args.psarc
@@ -279,6 +285,23 @@ def main() -> int:
         return 1
 
     print(f"[✓] Wrote {result}")
+
+    if args.auto_lyrics:
+        # Delegate to the lib's split path with transcribe_lyrics=True.
+        # The lib's _maybe_transcribe_lyrics handles the "lyrics already
+        # present" gate, so PSARCs that shipped vocals XML/SNG won't get
+        # overwritten by the auto-transcription.
+        from sloppak_convert import split_sloppak_stems
+        print("[*] Splitting stems + transcribing vocals")
+        try:
+            split_sloppak_stems(
+                result, progress_cb=_progress_printer, transcribe_lyrics=True,
+            )
+        except Exception as e:
+            print(f"\n[warn] --auto-lyrics step failed: {e}", file=sys.stderr)
+            # Don't fail the whole convert — the sloppak itself is valid.
+            return 0
+
     return 0
 
 

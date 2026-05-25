@@ -10,18 +10,20 @@ import sys
 import tempfile
 import shutil
 from pathlib import Path
+from typing import Any, ClassVar
 
 from logging_setup import configure_logging
 configure_logging()
 
 log = logging.getLogger("slopsmith.server")
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 
 from psarc import unpack_psarc, read_psarc_entries
+from safepath import safe_join
 from song import (
     anchor_to_wire,
     arrangement_string_count,
@@ -35,6 +37,7 @@ from song import (
 from audio import find_wem_files, convert_wem
 from tunings import tuning_name
 import sloppak as sloppak_mod
+import drums as drums_mod
 import loosefolder as loosefolder_mod
 
 import concurrent.futures
@@ -236,6 +239,11 @@ AUDIO_CACHE_DIR = CONFIG_DIR / "audio_cache"
 SLOPPAK_CACHE_DIR = CONFIG_DIR / "sloppak_cache"
 
 
+def _env_flag(name: str) -> bool:
+    """Parse a conventional boolean env flag."""
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 # ── SQLite metadata cache ─────────────────────────────────────────────────────
 
 class MetadataDB:
@@ -318,11 +326,13 @@ class MetadataDB:
         return {r[0] for r in self.conn.execute("SELECT filename FROM favorites").fetchall()}
 
     def get(self, filename: str, mtime: float, size: int) -> dict | None:
-        row = self.conn.execute(
-            "SELECT mtime, size, title, artist, album, year, duration, tuning, arrangements, has_lyrics, "
-            "format, stem_count, stem_ids, tuning_name, tuning_sort_key "
-            "FROM songs WHERE filename = ?", (filename,)
-        ).fetchone()
+        cache_key = str(filename)
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT mtime, size, title, artist, album, year, duration, tuning, arrangements, has_lyrics, "
+                "format, stem_count, stem_ids, tuning_name, tuning_sort_key "
+                "FROM songs WHERE filename = ?", (cache_key,)
+            ).fetchone()
         if row and row[0] == mtime and row[1] == size and row[2]:
             return {
                 "title": row[2], "artist": row[3], "album": row[4],
@@ -667,14 +677,369 @@ class MetadataDB:
         ).fetchall()
         letters = {}
         for letter, count in rows:
-            if letter and letter.isalpha():
-                letters[letter] = count
+            count = int(count or 0)
+            if count <= 0:
+                continue
+            key = str(letter or "")
+            if key.isascii() and key.isalpha():
+                letters[key] = letters.get(key, 0) + count
             else:
                 letters["#"] = letters.get("#", 0) + count
         return {"total_songs": total, "total_artists": artist_count, "letters": letters}
 
 
 meta_db = MetadataDB()
+
+
+class LocalLibraryProvider:
+    id = "local"
+    label = "My Library"
+    kind = "local"
+    capabilities = (
+        "library.read",
+        "art.read",
+        "song.play",
+        "favorite.write",
+        "metadata.write",
+        "retune.write",
+    )
+
+    def __init__(self, db: MetadataDB):
+        self._db = db
+
+    def query_page(self, **kwargs) -> tuple[list[dict], int]:
+        return self._db.query_page(**kwargs)
+
+    def query_artists(self, **kwargs) -> tuple[list[dict], int]:
+        return self._db.query_artists(**kwargs)
+
+    def query_stats(self, **kwargs) -> dict:
+        return self._db.query_stats(**kwargs)
+
+    def tuning_names(self) -> dict:
+        with self._db._lock:
+            rows = self._db.conn.execute(
+                "SELECT tuning_name, MIN(tuning_sort_key), COUNT(*) "
+                "FROM songs WHERE title != '' AND COALESCE(tuning_name, '') != '' "
+                "GROUP BY tuning_name COLLATE NOCASE "
+                "ORDER BY ABS(COALESCE(MIN(tuning_sort_key), 0)), "
+                "COALESCE(MIN(tuning_sort_key), 0) ASC, "
+                "tuning_name COLLATE NOCASE"
+            ).fetchall()
+        return {
+            "tunings": [
+                {"name": name, "sort_key": int(sk or 0), "count": count}
+                for name, sk, count in rows
+            ],
+        }
+
+    async def get_art(self, song_id: str):
+        return await get_song_art(song_id)
+
+
+class LibraryProviderRegistry:
+    # Methods required per declared capability — only validated when the
+    # provider advertises the corresponding capability so action-only providers
+    # (e.g. art.read + song.sync without library.read) don't need to implement
+    # unused stubs.
+    _CAPABILITY_METHODS: ClassVar[dict[str, tuple[str, ...]]] = {
+        "library.read": ("query_page", "query_artists", "query_stats", "tuning_names"),
+        "art.read": ("get_art",),
+        "song.sync": ("sync_song",),
+    }
+    _ID_RE: ClassVar[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+
+    def __init__(self):
+        self._providers: dict[str, object] = {}
+        # Capabilities inferred at registration for legacy providers that omit
+        # the `capabilities` field.  Merged with provider_capabilities() so that
+        # runtime capability checks see the complete effective capability set.
+        self._inferred_caps: dict[str, set[str]] = {}
+        self._lock = threading.RLock()
+
+    def register(self, provider: object, *, replace: bool = False) -> object:
+        provider_id = self.provider_id(provider)
+        if not self._ID_RE.match(provider_id):
+            raise ValueError(
+                "library provider id must start with an alphanumeric character "
+                "and contain only letters, digits, _, ., :, or -"
+            )
+        if not self.provider_label(provider):
+            raise ValueError("library provider label must be a non-empty string")
+        # Use declared-only caps during validation — never include stale inferred
+        # caps from a previous provider registered under the same id (replace=True).
+        caps = self._declared_capabilities(provider)
+        # Backward compatibility: providers that predate explicit capability
+        # declarations may omit `capabilities` entirely. If the browse methods
+        # are all present, infer `library.read` so they still work unchanged.
+        # If capabilities are absent but the browse surface is also absent,
+        # raise a clear error rather than letting the provider register and
+        # then fail on every API call with a late 501.
+        inferred: set[str] = set()
+        if not caps:
+            browse_methods = self._CAPABILITY_METHODS["library.read"]
+            if all(callable(self.provider_method(provider, m)) for m in browse_methods):
+                # Legacy provider without explicit capabilities — infer library.read
+                # from the presence of all browse methods.  Store in _inferred_caps
+                # so that runtime capability checks see the full effective set.
+                inferred = {"library.read"}
+                caps = inferred
+            else:
+                raise TypeError(
+                    f"library provider {provider_id!r} must declare at least one capability "
+                    f"(or implement the {browse_methods!r} browse methods for backward compatibility)"
+                )
+        for cap, methods in self._CAPABILITY_METHODS.items():
+            if cap not in caps:
+                continue
+            for method_name in methods:
+                if not callable(self.provider_method(provider, method_name)):
+                    raise TypeError(f"library provider {provider_id!r} declares {cap!r} but is missing callable {method_name}()")
+        with self._lock:
+            if provider_id == "local" and provider_id in self._providers and self._providers[provider_id] is not provider:
+                raise ValueError("the local library provider cannot be replaced")
+            if provider_id in self._providers and not replace:
+                raise ValueError(f"library provider {provider_id!r} is already registered")
+            self._providers[provider_id] = provider
+            if inferred:
+                self._inferred_caps[provider_id] = inferred
+            else:
+                self._inferred_caps.pop(provider_id, None)
+        return provider
+
+    def unregister(self, provider_id: str) -> bool:
+        if provider_id == "local":
+            raise ValueError("the local library provider cannot be unregistered")
+        with self._lock:
+            self._inferred_caps.pop(provider_id, None)
+            return self._providers.pop(provider_id, None) is not None
+
+    def get(self, provider_id: str = "local") -> object | None:
+        with self._lock:
+            return self._providers.get(provider_id or "local")
+
+    def list(self) -> list[dict]:
+        with self._lock:
+            providers = list(self._providers.values())
+        return [self.describe(provider) for provider in providers]
+
+    def describe(self, provider: object) -> dict:
+        provider_id = self.provider_id(provider)
+        return {
+            "id": provider_id,
+            "label": self.provider_label(provider),
+            "kind": self.provider_field(provider, "kind", "local" if provider_id == "local" else "remote"),
+            "capabilities": sorted(self.provider_capabilities(provider)),
+            "default": provider_id == "local",
+        }
+
+    def provider_field(self, provider: object, name: str, default=None):
+        if isinstance(provider, dict):
+            return provider.get(name, default)
+        return getattr(provider, name, default)
+
+    def provider_id(self, provider: object) -> str:
+        provider_id = self.provider_field(provider, "id", "")
+        if not isinstance(provider_id, str) or not provider_id:
+            raise ValueError("library provider id must be a non-empty string")
+        return provider_id
+
+    def provider_label(self, provider: object) -> str:
+        label = self.provider_field(provider, "label", self.provider_field(provider, "name", ""))
+        if not isinstance(label, str):
+            return ""
+        return label.strip()
+
+    def _declared_capabilities(self, provider: object) -> set[str]:
+        """Return only the capabilities explicitly declared on the provider object."""
+        raw = self.provider_field(provider, "capabilities", ())
+        if raw is None:
+            raw = ()
+        if isinstance(raw, str):
+            raw = (raw,) if raw else ()
+        return {str(cap) for cap in raw if cap}
+
+    def provider_capabilities(self, provider: object) -> set[str]:
+        # Guard against a common plugin authoring mistake: passing a single string
+        # instead of a list/tuple. Iterating a string produces individual characters,
+        # none of which would match a valid capability name.
+        declared = self._declared_capabilities(provider)
+        # Merge with any capabilities inferred at registration time for legacy
+        # providers that omit the `capabilities` field but implement browse methods.
+        provider_id = self.provider_id(provider)
+        with self._lock:
+            inferred = self._inferred_caps.get(provider_id, set())
+        return declared | inferred
+
+    def provider_method(self, provider: object, name: str):
+        if isinstance(provider, dict):
+            return provider.get(name)
+        return getattr(provider, name, None)
+
+
+library_providers = LibraryProviderRegistry()
+library_providers.register(LocalLibraryProvider(meta_db))
+
+
+def register_library_provider(provider: object, *, replace: bool = False) -> object:
+    return library_providers.register(provider, replace=replace)
+
+
+def unregister_library_provider(provider_id: str) -> bool:
+    return library_providers.unregister(provider_id)
+
+
+def _get_library_provider(provider: str = "local") -> object:
+    library_provider = library_providers.get(provider or "local")
+    if library_provider is None:
+        raise HTTPException(status_code=404, detail=f"Unknown library provider: {provider}")
+    return library_provider
+
+
+def _require_library_provider_capability(provider: object, capability: str) -> None:
+    if capability in library_providers.provider_capabilities(provider):
+        return
+    provider_id = library_providers.provider_id(provider)
+    raise HTTPException(
+        status_code=501,
+        detail=f"Library provider {provider_id!r} does not declare capability {capability!r}",
+    )
+
+
+def _call_library_provider(provider: object, method_name: str, **kwargs) -> Any:
+    method = library_providers.provider_method(provider, method_name)
+    if not callable(method):
+        provider_id = library_providers.provider_id(provider)
+        raise HTTPException(
+            status_code=501,
+            detail=f"Library provider {provider_id!r} does not support {method_name}",
+        )
+    try:
+        return method(**kwargs)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        provider_id = library_providers.provider_id(provider)
+        # A provider with an explicit kind="local" is treated as local even if
+        # its id is not "local" (e.g. a kind="local" plugin variant). Otherwise
+        # fall back to provider_id comparison so providers that omit `kind` are
+        # still wrapped correctly — the safe default for unknown providers is to
+        # surface an offline message rather than leaking raw exceptions.
+        provider_kind = str(library_providers.provider_field(provider, "kind", "") or "")
+        if provider_kind:
+            is_remote = provider_kind not in ("", "local")
+        else:
+            is_remote = provider_id != "local"
+        if is_remote:
+            detail = f"This source appears to be offline ({provider_id})."
+            message = str(exc).strip()
+            if message:
+                detail = f"{detail} {message}"
+            raise HTTPException(status_code=503, detail=detail) from exc
+        raise
+
+
+def _is_async_callable(obj: object) -> bool:
+    """Return True if obj is an async function or a callable object with an async __call__.
+
+    ``inspect.iscoroutinefunction`` only recognises bare coroutine functions; it returns
+    False for class instances whose ``__call__`` method is defined as ``async def``.
+    Checking both handles the common plugin pattern of wrapping an async method in a
+    callable object.
+    """
+    if inspect.iscoroutinefunction(obj):
+        return True
+    _call = getattr(obj, "__call__", None)
+    return _call is not None and inspect.iscoroutinefunction(_call)
+
+
+async def _call_library_provider_async(provider: object, method_name: str, **kwargs) -> Any:
+    method = library_providers.provider_method(provider, method_name)
+    if _is_async_callable(method):
+        # Async provider method — call directly on the event loop.
+        try:
+            return await method(**kwargs)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            provider_id = library_providers.provider_id(provider)
+            provider_kind = str(library_providers.provider_field(provider, "kind", "") or "")
+            if provider_kind:
+                is_remote = provider_kind not in ("", "local")
+            else:
+                is_remote = provider_id != "local"
+            if is_remote:
+                detail = f"This source appears to be offline ({provider_id})."
+                message = str(exc).strip()
+                if message:
+                    detail = f"{detail} {message}"
+                raise HTTPException(status_code=503, detail=detail) from exc
+            raise
+    # Synchronous provider method — run in a threadpool so the event loop stays free.
+    return await run_in_threadpool(_call_library_provider, provider, method_name, **kwargs)
+
+
+def _safe_art_redirect_url(url: str) -> str | None:
+    """Return the URL if it is safe to redirect to (http/https only), else None."""
+    from urllib.parse import urlparse
+    if not url or not isinstance(url, str):
+        return None
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme.lower() not in ("http", "https"):
+            return None
+        if not parsed.hostname:
+            return None
+        return url
+    except Exception:
+        return None
+
+
+def _library_art_response(result: Any) -> Response:
+    if result is None:
+        raise HTTPException(status_code=404, detail="Library provider returned no art")
+    if isinstance(result, Response):
+        return result
+    if isinstance(result, (bytes, bytearray, memoryview)):
+        return Response(content=bytes(result), media_type="image/png")
+    if isinstance(result, str):
+        safe_url = _safe_art_redirect_url(result)
+        if safe_url is not None:
+            return RedirectResponse(safe_url)
+        # If the string looks like a URL (contains a scheme separator) but
+        # didn't pass the http/https check, refuse it rather than treating
+        # it as a filesystem path — a provider returning ftp:// or file://
+        # should get a 400, not a 500 from FileResponse failing on a URL.
+        if "://" in result:
+            raise HTTPException(
+                status_code=400,
+                detail="Library provider returned an unsupported URL scheme for art",
+            )
+        if not Path(result).is_file():
+            raise HTTPException(status_code=404, detail="Library provider returned an unreadable art path")
+        return FileResponse(result)
+    if isinstance(result, Path):
+        if not result.is_file():
+            raise HTTPException(status_code=404, detail="Library provider returned an unreadable art path")
+        return FileResponse(str(result))
+    if isinstance(result, dict):
+        url = result.get("url") or result.get("art_url") or result.get("artUrl")
+        if isinstance(url, str) and url:
+            safe_url = _safe_art_redirect_url(url)
+            if safe_url is None:
+                raise HTTPException(status_code=400, detail="Library provider returned an unsafe art URL")
+            return RedirectResponse(safe_url)
+        path = result.get("path") or result.get("file")
+        if isinstance(path, (str, Path)):
+            media_type = result.get("media_type") or result.get("content_type")
+            if not Path(path).is_file():
+                raise HTTPException(status_code=404, detail="Library provider returned an unreadable art path")
+            return FileResponse(str(path), media_type=media_type)
+        content = result.get("content") or result.get("bytes")
+        if isinstance(content, (bytes, bytearray, memoryview)):
+            media_type = result.get("media_type") or result.get("content_type") or "image/png"
+            return Response(content=bytes(content), media_type=media_type)
+    raise HTTPException(status_code=500, detail="Library provider returned unsupported art data")
 
 
 def _get_dlc_dir(cfg: dict | None = None) -> Path | None:
@@ -688,7 +1053,7 @@ def _get_dlc_dir(cfg: dict | None = None) -> Path | None:
         config_file = CONFIG_DIR / "config.json"
         if config_file.exists():
             try:
-                cfg = json.loads(config_file.read_text())
+                cfg = json.loads(config_file.read_text(encoding="utf-8"))
             except Exception:
                 pass
     if isinstance(cfg, dict):
@@ -823,14 +1188,7 @@ def _resolve_dlc_path(dlc: Path, filename: str) -> Path | None:
     Returns the validated resolved Path, or None if the path is empty
     or escapes the DLC root.
     """
-    if not filename:
-        return None
-    try:
-        resolved = (dlc / filename).resolve()
-        resolved.relative_to(dlc.resolve())
-    except (ValueError, OSError):
-        return None
-    return resolved
+    return safe_join(dlc, filename)
 
 
 def _sanitized_song_offset(song) -> float:
@@ -1148,7 +1506,15 @@ def _background_scan():
         except OSError as e:
             log.debug("scan: skipping %s (%s)", f, e)
             continue
-        if not meta_db.get(_rel(f), mtime, size):
+        cache_key = _rel(f)
+        try:
+            cached = meta_db.get(cache_key, mtime, size)
+        except Exception as e:
+            # Keep scanning even if a single metadata lookup fails.
+            # The file will be re-scanned and cache repaired by put().
+            log.warning("scan cache lookup failed for %s: %s", cache_key, e)
+            cached = None
+        if not cached:
             to_scan.append((f, mtime, size))
 
     if not to_scan:
@@ -1255,6 +1621,75 @@ async def startup_events():
     global _event_loop
     _event_loop = loop
 
+    # Test/CI escape hatch: tests that import the FastAPI app via TestClient
+    # don't need plugin loading or the background library scan, and those
+    # paths touch the user filesystem in ways that aren't safe under
+    # parallel test runs. Drive startup straight to a terminal "complete"
+    # phase so any frontend startup waiter that observes the lifespan also
+    # unblocks cleanly (the SSE/poll client treats only `complete` and
+    # `error` as terminal when `running` becomes false).
+    if _env_flag("SLOPSMITH_SKIP_STARTUP_TASKS"):
+        log.info("[startup] Skipping plugin load and background scan")
+        # Tests pop `server` from sys.modules across runs, but the `plugins`
+        # module is not reloaded — so LOADED_PLUGINS can carry stale entries
+        # from a previous test's startup, which `/api/plugins` would then
+        # expose despite this branch reporting zero loaded plugins. Normal
+        # startup clears it inside load_plugins; do the same here under the
+        # same lock so this skip path matches that invariant.
+        from plugins import LOADED_PLUGINS, PLUGINS_LOCK
+        with PLUGINS_LOCK:
+            LOADED_PLUGINS.clear()
+        _set_startup_status(
+            running=False,
+            phase="complete",
+            message="Startup tasks skipped (SLOPSMITH_SKIP_STARTUP_TASKS).",
+            error=None,
+            current_plugin="",
+            loaded=0,
+            total=0,
+        )
+        return
+
+    # Sweep stranded PSARC/Demucs staging dirs from any previous run
+    # that was SIGKILL'd mid-conversion. lib/sloppak_convert.py wraps
+    # each conversion in `tempfile.mkdtemp(prefix="s2p_extract_")` /
+    # `tempfile.TemporaryDirectory(prefix="s2p_split_")` (and other
+    # `s2p_*` variants); cleanup runs only in the normal `finally` /
+    # `__exit__` path —
+    # kills (Docker shutdown timeout, OOM, `docker compose restart`
+    # mid-job) leak the staging dir, and bulk-converts can leave many
+    # GB across restarts. Run before plugin load so the sloppak-
+    # converter plugin's worker starts on a clean `/tmp` even if the
+    # previous server died holding extractions. Sits AFTER the
+    # SLOPSMITH_SKIP_STARTUP_TASKS escape hatch so test runs that
+    # need a true filesystem no-op still get one.
+    try:
+        from sloppak_convert import cleanup_stale_temp_dirs
+        # 15 minutes — safety margin chosen to cover the worst-case
+        # file-write gap of any routine in `lib/sloppak_convert.py`.
+        # The remote Demucs path (`_run_demucs_remote`) uploads the
+        # audio and then polls the server for up to 10 minutes
+        # (`for _ in range(120): time.sleep(5)`) before downloading
+        # the stems; during that poll no files are written under the
+        # staging dir. A concurrent server restart at the 5-minute
+        # mark would see an `s2p_split_*` dir with no descendants
+        # touched in >300s and delete it — breaking the live job when
+        # downloads start. 900s (15 min) clears the full 10-min poll
+        # plus a generous margin for upload and download time.
+        # For local Demucs / PSARC / WEM routines, which write
+        # continuously, the recursive mtime check correctly keeps
+        # active dirs alive; the 15-min threshold is still far shorter
+        # than the weeks a truly stranded dir would accumulate.
+        # Cost of being conservative: a kill less than 15 minutes
+        # before *this* restart leaves its staging dir for the next
+        # startup pass — fine; the next sweep catches it.
+        cleanup_stale_temp_dirs(min_age_seconds=900.0)
+    except Exception:
+        # `log.exception` (vs `log.warning(... %s, e)`) preserves the
+        # traceback — useful for distinguishing import errors,
+        # permission denials, and runtime failures inside the helper.
+        log.exception("startup temp-dir cleanup failed")
+
     _set_startup_status(
         running=True,
         phase="starting",
@@ -1267,6 +1702,11 @@ async def startup_events():
         "get_dlc_dir": _get_dlc_dir,
         "extract_meta": _extract_meta_for_file,
         "meta_db": meta_db,
+        "get_scan_status": lambda: dict(_scan_status),
+        "get_art_cache_dir": lambda: ART_CACHE_DIR,
+        "library_providers": library_providers,
+        "register_library_provider": register_library_provider,
+        "unregister_library_provider": unregister_library_provider,
         "get_sloppak_cache_dir": lambda: SLOPPAK_CACHE_DIR,
         "register_demo_janitor_hook": register_demo_janitor_hook,
     }
@@ -1550,19 +1990,70 @@ def _periodic_rescan():
         time.sleep(300)
 
 
+def _safe_http_url(raw):
+    """Return `raw` stripped + trailing-slash-stripped if it parses as an
+    http(s) URL with a non-empty host; else None.
+
+    Used to validate operator-supplied `APP_SOURCE_URL` / `APP_LICENSE_URL`
+    env vars before they reach `<a href>` in the UI. A bare prefix check
+    like `startswith(("http://","https://"))` accepts malformed inputs
+    such as `"https://"` (no host) or `"https:///foo"` (empty host) that
+    still produce broken hrefs — and, when used as a base for the default
+    `license_url`, garbage like `"https:///blob/main/LICENSE"`.
+    """
+    from urllib.parse import urlsplit
+    if not raw:
+        return None
+    s = raw.strip().rstrip("/")
+    if not s:
+        return None
+    try:
+        parsed = urlsplit(s)
+    except ValueError:
+        return None
+    if parsed.scheme.lower() not in ("http", "https"):
+        return None
+    # `netloc` includes any `user:pass@` and `:port` — strings like
+    # "http://:80/path" have non-empty netloc (":80") but no real
+    # hostname. Validate `hostname` so only URLs with an actual host
+    # are accepted.
+    if not parsed.hostname:
+        return None
+    return s
+
+
 @app.get("/api/version")
 def get_version():
     env_version = os.environ.get("APP_VERSION", "").strip()
     if env_version:
-        return {"version": env_version}
-    version_file = Path(__file__).parent / "VERSION"
-    version = "unknown"
-    if version_file.exists():
-        try:
-            version = version_file.read_text().strip()
-        except (OSError, UnicodeDecodeError):
-            pass
-    return {"version": version}
+        version = env_version
+    else:
+        version_file = Path(__file__).parent / "VERSION"
+        version = "unknown"
+        if version_file.exists():
+            try:
+                version = version_file.read_text().strip()
+            except (OSError, UnicodeDecodeError):
+                pass
+    default_source_url = "https://github.com/byrongamatos/slopsmith"
+    # APP_SOURCE_URL / APP_LICENSE_URL flow straight into <a href> in the UI,
+    # so validate with urllib.parse rather than a bare prefix check — a prefix
+    # check accepts malformed values like "https://" (no host) which produce
+    # broken hrefs (and a constructed license_url like "https:///blob/main/LICENSE").
+    # _safe_http_url requires scheme in {http,https} AND a non-empty hostname
+    # (not just netloc — that would still accept port-only authorities like
+    # "http://:80/path"); fall back to the safe default otherwise.
+    source_url = _safe_http_url(os.environ.get("APP_SOURCE_URL")) or default_source_url
+    # APP_LICENSE_URL: explicit override for the LICENSE link. The default
+    # constructed value (source_url + "/blob/main/LICENSE") is GitHub-
+    # specific and assumes the repo's default branch is `main`; non-GitHub
+    # hosts (GitLab, Gitea, self-hosted) need an explicit value.
+    license_url = _safe_http_url(os.environ.get("APP_LICENSE_URL")) or (source_url + "/blob/main/LICENSE")
+    return {
+        "version": version,
+        "source_url": source_url,
+        "license_url": license_url,
+    }
 
 
 @app.get("/api/scan-status")
@@ -2083,98 +2574,135 @@ def _parse_has_lyrics(raw: str) -> int | None:
     return None
 
 
-@app.get("/api/library")
-def list_library(q: str = "", page: int = 0, size: int = 24, sort: str = "artist",
-                 dir: str = "asc", favorites: int = 0, format: str = "",
-                 arrangements_has: str = "", arrangements_lacks: str = "",
-                 stems_has: str = "", stems_lacks: str = "",
-                 has_lyrics: str = "", tunings: str = ""):
-    """Paginated library search, queried from SQLite."""
-    size = min(size, 100)
+def _library_filter_args(q: str = "", favorites: int = 0, format: str = "",
+                         arrangements_has: str = "", arrangements_lacks: str = "",
+                         stems_has: str = "", stems_lacks: str = "",
+                         has_lyrics: str = "", tunings: str = "") -> dict:
     fmt = format if format in ("psarc", "sloppak", "loose") else ""
-    songs, total = meta_db.query_page(
-        q=q, page=page, size=size, sort=sort,
-        direction=dir, favorites_only=bool(favorites), format_filter=fmt,
-        arrangements_has=_split_csv(arrangements_has),
-        arrangements_lacks=_split_csv(arrangements_lacks),
-        stems_has=_split_csv(stems_has),
-        stems_lacks=_split_csv(stems_lacks),
-        has_lyrics=_parse_has_lyrics(has_lyrics),
-        tunings=_split_csv(tunings),
+    return {
+        "q": q,
+        "favorites_only": bool(favorites),
+        "format_filter": fmt,
+        "arrangements_has": _split_csv(arrangements_has),
+        "arrangements_lacks": _split_csv(arrangements_lacks),
+        "stems_has": _split_csv(stems_has),
+        "stems_lacks": _split_csv(stems_lacks),
+        "has_lyrics": _parse_has_lyrics(has_lyrics),
+        "tunings": _split_csv(tunings),
+    }
+
+
+@app.get("/api/library/providers")
+def list_library_providers():
+    """List registered library providers."""
+    return {"providers": library_providers.list()}
+
+
+@app.get("/api/library/providers/{provider_id}/songs/{song_id:path}/art")
+async def get_library_provider_song_art(provider_id: str, song_id: str):
+    """Return album art for a song owned by a library provider."""
+    library_provider = _get_library_provider(provider_id)
+    _require_library_provider_capability(library_provider, "art.read")
+    result = await _call_library_provider_async(library_provider, "get_art", song_id=song_id)
+    return _library_art_response(result)
+
+
+@app.post("/api/library/providers/{provider_id}/songs/{song_id:path}/sync")
+async def sync_library_provider_song(provider_id: str, song_id: str):
+    """Ask a provider to sync a remote song into the local library/cache."""
+    library_provider = _get_library_provider(provider_id)
+    _require_library_provider_capability(library_provider, "song.sync")
+    result = await _call_library_provider_async(library_provider, "sync_song", song_id=song_id)
+    if result is None:
+        return {"ok": True}
+    if isinstance(result, dict):
+        return result
+    return {"ok": True, "result": result}
+
+
+@app.get("/api/library")
+async def list_library(q: str = "", page: int = 0, size: int = 24, sort: str = "artist",
+                       dir: str = "asc", favorites: int = 0, format: str = "",
+                       arrangements_has: str = "", arrangements_lacks: str = "",
+                       stems_has: str = "", stems_lacks: str = "",
+                       has_lyrics: str = "", tunings: str = "", provider: str = "local"):
+    """Paginated library search through the selected library provider."""
+    size = min(size, 100)
+    library_provider = _get_library_provider(provider)
+    _require_library_provider_capability(library_provider, "library.read")
+    songs, total = await _call_library_provider_async(
+        library_provider,
+        "query_page",
+        page=page,
+        size=size,
+        sort=sort,
+        direction=dir,
+        **_library_filter_args(
+            q=q, favorites=favorites, format=format,
+            arrangements_has=arrangements_has, arrangements_lacks=arrangements_lacks,
+            stems_has=stems_has, stems_lacks=stems_lacks,
+            has_lyrics=has_lyrics, tunings=tunings,
+        ),
     )
     return {"songs": songs, "total": total, "page": page, "size": size}
 
 
 @app.get("/api/library/artists")
-def list_artists(letter: str = "", q: str = "", favorites: int = 0, page: int = 0, size: int = 50,
-                 format: str = "",
-                 arrangements_has: str = "", arrangements_lacks: str = "",
-                 stems_has: str = "", stems_lacks: str = "",
-                 has_lyrics: str = "", tunings: str = ""):
+async def list_artists(letter: str = "", q: str = "", favorites: int = 0, page: int = 0,
+                       size: int = 50, format: str = "",
+                       arrangements_has: str = "", arrangements_lacks: str = "",
+                       stems_has: str = "", stems_lacks: str = "",
+                       has_lyrics: str = "", tunings: str = "", provider: str = "local"):
     """Get artists grouped by letter with albums and songs (for tree view)."""
-    fmt = format if format in ("psarc", "sloppak", "loose") else ""
-    artists, total = meta_db.query_artists(
-        letter=letter, q=q, favorites_only=bool(favorites),
-        page=page, size=min(size, 100), format_filter=fmt,
-        arrangements_has=_split_csv(arrangements_has),
-        arrangements_lacks=_split_csv(arrangements_lacks),
-        stems_has=_split_csv(stems_has),
-        stems_lacks=_split_csv(stems_lacks),
-        has_lyrics=_parse_has_lyrics(has_lyrics),
-        tunings=_split_csv(tunings),
+    size = min(size, 100)
+    library_provider = _get_library_provider(provider)
+    _require_library_provider_capability(library_provider, "library.read")
+    artists, total = await _call_library_provider_async(
+        library_provider,
+        "query_artists",
+        letter=letter,
+        page=page,
+        size=size,
+        **_library_filter_args(
+            q=q, favorites=favorites, format=format,
+            arrangements_has=arrangements_has, arrangements_lacks=arrangements_lacks,
+            stems_has=stems_has, stems_lacks=stems_lacks,
+            has_lyrics=has_lyrics, tunings=tunings,
+        ),
     )
     return {"artists": artists, "total_artists": total, "page": page, "size": size}
 
 
 @app.get("/api/library/stats")
-def library_stats(favorites: int = 0, q: str = "", format: str = "",
-                  arrangements_has: str = "", arrangements_lacks: str = "",
-                  stems_has: str = "", stems_lacks: str = "",
-                  has_lyrics: str = "", tunings: str = ""):
+async def library_stats(favorites: int = 0, q: str = "", format: str = "",
+                        arrangements_has: str = "", arrangements_lacks: str = "",
+                        stems_has: str = "", stems_lacks: str = "",
+                        has_lyrics: str = "", tunings: str = "", provider: str = "local"):
     """Aggregate stats for the UI. Accepts the same filter params as
     /api/library so the letter bar mirrors the active grid filter set."""
-    fmt = format if format in ("psarc", "sloppak", "loose") else ""
-    return meta_db.query_stats(
-        favorites_only=bool(favorites), q=q, format_filter=fmt,
-        arrangements_has=_split_csv(arrangements_has),
-        arrangements_lacks=_split_csv(arrangements_lacks),
-        stems_has=_split_csv(stems_has),
-        stems_lacks=_split_csv(stems_lacks),
-        has_lyrics=_parse_has_lyrics(has_lyrics),
-        tunings=_split_csv(tunings),
+    library_provider = _get_library_provider(provider)
+    _require_library_provider_capability(library_provider, "library.read")
+    return await _call_library_provider_async(
+        library_provider,
+        "query_stats",
+        **_library_filter_args(
+            q=q, favorites=favorites, format=format,
+            arrangements_has=arrangements_has, arrangements_lacks=arrangements_lacks,
+            stems_has=stems_has, stems_lacks=stems_lacks,
+            has_lyrics=has_lyrics, tunings=tunings,
+        ),
     )
 
 
 @app.get("/api/library/tuning-names")
-def list_tuning_names():
+async def list_tuning_names(provider: str = "local"):
     """Distinct tuning names present in the library, with per-tuning
     counts. Powers the tuning multi-select. Sorted by `tuning_sort_key`
     so names appear in the same musical order the sort uses
     (slopsmith#22) — E Standard first, then nearest neighbors."""
-    rows = meta_db.conn.execute(
-        "SELECT tuning_name, MIN(tuning_sort_key), COUNT(*) "
-        # NULL/empty-name rows are excluded entirely from the picker —
-        # users can't usefully filter by an unknown tuning. Once they
-        # rescan, the rows acquire a name and join the list.
-        "FROM songs WHERE title != '' AND COALESCE(tuning_name, '') != '' "
-        "GROUP BY tuning_name COLLATE NOCASE "
-        # Same ordering as `sort=tuning` in `query_page`: distance
-        # from E Standard first, then signed-key ASC so the down-
-        # tuned variant precedes the up-tuned one at equal distance
-        # (Eb Standard before F Standard at distance 6). Final
-        # alphabetical tiebreak keeps the order deterministic.
-        # COALESCE around the sort_key guards against NULL the same
-        # way the main tuning sort does.
-        "ORDER BY ABS(COALESCE(MIN(tuning_sort_key), 0)), "
-        "COALESCE(MIN(tuning_sort_key), 0) ASC, "
-        "tuning_name COLLATE NOCASE"
-    ).fetchall()
-    return {
-        "tunings": [
-            {"name": name, "sort_key": int(sk or 0), "count": count}
-            for name, sk, count in rows
-        ],
-    }
+    library_provider = _get_library_provider(provider)
+    _require_library_provider_capability(library_provider, "library.read")
+    return await _call_library_provider_async(library_provider, "tuning_names")
 
 
 @app.post("/api/favorites/toggle")
@@ -2230,6 +2758,10 @@ def delete_loop(loop_id: int):
 
 # ── Settings API ──────────────────────────────────────────────────────────────
 
+# Serializes the read-modify-write in save_settings(). See the note there.
+_settings_lock = threading.Lock()
+
+
 def _default_settings():
     """Fallback settings returned when config.json is missing or
     unreadable. Also used to seed a fresh cfg on first-run POSTs so a
@@ -2255,7 +2787,11 @@ def _load_config(config_file):
     if not config_file.exists():
         return None
     try:
-        parsed = json.loads(config_file.read_text())
+        # Explicit UTF-8: save_settings()/import write config.json as
+        # UTF-8 bytes, so the read must not depend on the platform's
+        # default text encoding (cp1252 on Windows would mojibake or
+        # UnicodeDecodeError on a non-ASCII DLC path).
+        parsed = json.loads(config_file.read_text(encoding="utf-8"))
     except Exception:
         return None
     return parsed if isinstance(parsed, dict) else None
@@ -2272,19 +2808,17 @@ def save_settings(data: dict):
     # Partial-update: merge only keys present in the request body so
     # single-key POSTs (like the difficulty slider's oninput) don't
     # clobber unrelated settings on disk.
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    #
+    # Validation runs FIRST, outside _settings_lock. The dlc_dir branch
+    # stats the folder and counts .psarc files, which can be slow on a
+    # large or networked DLC dir — holding the lock across it would block
+    # every other settings writer (dropdown/slider autosaves, imports).
+    # So validation only resolves `updates` (the keys to merge); the
+    # short read-merge-write critical section at the end takes the lock.
     config_file = CONFIG_DIR / "config.json"
-    # Seed defaults when config.json is missing, unreadable, or parses
-    # to a non-dict (e.g. `[]`, `42`). Without the non-dict guard, the
-    # next `cfg["..."] = ...` assignment would raise TypeError and 500
-    # the public endpoint. Seeding also ensures single-key POSTs (the
-    # difficulty slider's fire-and-forget write) don't produce a config
-    # file missing the dlc_dir fallback GET would have surfaced.
-    cfg = _load_config(config_file)
-    if cfg is None:
-        cfg = _default_settings()
+    updates: dict = {}
+    messages: list[str] = []
 
-    messages = []
     if "dlc_dir" in data:
         dlc_path = data["dlc_dir"]
         # null / missing is no-op (preserve on-disk value). Only an
@@ -2295,10 +2829,10 @@ def save_settings(data: dict):
         elif not isinstance(dlc_path, str):
             return {"error": "dlc_dir must be a string path or empty"}
         elif dlc_path == "":
-            cfg["dlc_dir"] = ""
+            updates["dlc_dir"] = ""
         else:
             if Path(dlc_path).is_dir():
-                cfg["dlc_dir"] = dlc_path
+                updates["dlc_dir"] = dlc_path
                 count = sum(1 for f in Path(dlc_path).iterdir() if f.suffix == ".psarc")
                 messages.append(f"DLC folder: {count} .psarc files found")
             else:
@@ -2317,7 +2851,7 @@ def save_settings(data: dict):
             elif not isinstance(raw, str):
                 return {"error": f"{key} must be a string or empty"}
             else:
-                cfg[key] = raw
+                updates[key] = raw
     if "master_difficulty" in data:
         # Coerce defensively — public endpoint, so `null`, `""`, or a
         # non-numeric string shouldn't 500 the request. float() accepts
@@ -2330,7 +2864,7 @@ def save_settings(data: dict):
         if isinstance(raw, bool):
             return {"error": "master_difficulty must be a number between 0 and 100"}
         try:
-            cfg["master_difficulty"] = max(0, min(100, int(float(raw))))
+            updates["master_difficulty"] = max(0, min(100, int(float(raw))))
         except (TypeError, ValueError, OverflowError):
             # OverflowError covers int(float("inf")) / int(float("1e309"))
             # which Python raises distinctly from ValueError.
@@ -2349,7 +2883,7 @@ def save_settings(data: dict):
         if isinstance(raw, bool):
             return {"error": "av_offset_ms must be a number between -1000 and 1000"}
         try:
-            cfg["av_offset_ms"] = max(-1000.0, min(1000.0, float(raw)))
+            updates["av_offset_ms"] = max(-1000.0, min(1000.0, float(raw)))
         except (TypeError, ValueError, OverflowError):
             return {"error": "av_offset_ms must be a number between -1000 and 1000"}
 
@@ -2361,9 +2895,25 @@ def save_settings(data: dict):
         if raw is not None:
             if not isinstance(raw, str) or raw not in ("both", "pc", "mac"):
                 return {"error": "psarc_platform must be 'both', 'pc', or 'mac'"}
-            cfg["psarc_platform"] = raw
+            updates["psarc_platform"] = raw
 
-    config_file.write_text(json.dumps(cfg, indent=2))
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    # Critical section — the read-merge-write must be atomic. FastAPI runs
+    # sync handlers in a threadpool, so two concurrent partial POSTs (e.g.
+    # the two Settings dropdowns auto-saving back-to-back) could each read
+    # the pre-write file and the second write would silently drop the
+    # first's key. /api/settings/import shares _settings_lock for the same
+    # reason. The seed-from-_default_settings() guards a missing/unreadable
+    # /non-dict config.json so the merge can't TypeError and 500 the
+    # endpoint. The write is atomic temp+rename so a concurrent reader
+    # (export, get_settings, the _get_dlc_dir fallback) never sees a torn
+    # file.
+    with _settings_lock:
+        cfg = _load_config(config_file)
+        if cfg is None:
+            cfg = _default_settings()
+        cfg.update(updates)
+        _atomic_write_file(config_file, json.dumps(cfg, indent=2).encode("utf-8"))
     return {"message": ". ".join(messages) if messages else "Settings saved"}
 
 
@@ -2895,10 +3445,14 @@ def import_settings(bundle: dict):
         # plugin state. Full-replace: caller is responsible for the
         # whole dict — this is restore semantics, not partial-update.
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        _atomic_write_file(
-            CONFIG_DIR / "config.json",
-            json.dumps(server_config, indent=2).encode("utf-8"),
-        )
+        # Share _settings_lock with save_settings() so a full-replace
+        # import and a concurrent partial-update POST can't interleave
+        # on config.json and drop each other's write.
+        with _settings_lock:
+            _atomic_write_file(
+                CONFIG_DIR / "config.json",
+                json.dumps(server_config, indent=2).encode("utf-8"),
+            )
     except OSError as e:
         # Phase-1 validation should have caught all foreseeable
         # failures; an OSError here means disk-level trouble (ENOSPC,
@@ -2933,7 +3487,6 @@ def import_settings(bundle: dict):
 # The bundle format is specified in docs/diagnostics-bundle-spec.md.
 
 from fastapi import Body
-from fastapi.responses import Response
 
 from diagnostics_bundle import build_bundle as _diag_build, preview_bundle as _diag_preview
 from diagnostics_hardware import collect as _diag_hardware
@@ -3683,7 +4236,7 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
             config_file = CONFIG_DIR / "config.json"
             if config_file.exists():
                 try:
-                    pref = json.loads(config_file.read_text()).get("default_arrangement", "")
+                    pref = json.loads(config_file.read_text(encoding="utf-8")).get("default_arrangement", "")
                 except Exception:
                     pass
             if pref:
@@ -3867,7 +4420,44 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
             "offset": _sanitized_song_offset(song) if is_loose else 0.0,
             "format": "sloppak" if is_slop else ("loose" if is_loose else "psarc"),
             "stems": stems_payload,
+            # Surface a drum_tab presence flag so the visualization picker
+            # can auto-activate the drums plugin even when the chosen
+            # arrangement isn't named "Drums" (drum_tab.json lives next
+            # to the manifest, not inside the arrangements list).
+            "has_drum_tab": bool(
+                is_slop and loaded_slop is not None and loaded_slop.drum_tab is not None
+            ),
         })
+
+        # Send drum_tab when the sloppak ships one (manifest `drum_tab:` key,
+        # see lib/sloppak.py). The drums plugin subscribes to `drum_tab` for
+        # the kit legend and `drum_hits` for the timed hit stream. Chunked
+        # 500-per-frame like notes so a long song stays well under WS frame
+        # limits. Legacy drum sloppaks (drums encoded as guitar notes) skip
+        # this branch and fall through to the regular `notes` stream — the
+        # client-side drums plugin keeps a fallback decoder for them.
+        if is_slop and loaded_slop is not None and loaded_slop.drum_tab is not None:
+            dt = loaded_slop.drum_tab
+            kit = drums_mod.normalise_kit(dt.get("kit"))
+            hits_wire = drums_mod.hits_to_wire(dt.get("hits") or [])
+            _dt_name = dt.get("name")
+            _dt_name = _dt_name if isinstance(_dt_name, str) and _dt_name else "Drums"
+            try:
+                await websocket.send_json({
+                    "type": "drum_tab",
+                    "version": int(dt.get("version", drums_mod.SCHEMA_VERSION)),
+                    "name": _dt_name,
+                    "kit": kit,
+                    "total": len(hits_wire),
+                })
+                for i in range(0, len(hits_wire), 500):
+                    await websocket.send_json({
+                        "type": "drum_hits",
+                        "data": hits_wire[i:i + 500],
+                        "total": len(hits_wire),
+                    })
+            except WebSocketDisconnect:
+                return
 
         # Send beats
         beats = [{"time": b.time, "measure": b.measure} for b in song.beats]
@@ -3894,6 +4484,7 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
         # Send lyrics if available
         import xml.etree.ElementTree as ET
         lyrics = []
+        lyrics_source = ""
         # Loose folders are flat — only inspect direct children so a
         # nested backup/export directory inside the song folder can't
         # override the active arrangement's lyrics / tone. PSARCs are
@@ -3904,18 +4495,33 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
         _json_walk = Path(tmp).glob if is_loose else Path(tmp).rglob
         if is_slop:
             lyrics = list(song.lyrics or [])
+            lyrics_source = getattr(song, "lyrics_source", "") or ""
         else:
             for xml_path in sorted(_xml_walk("*.xml")):
                 try:
                     root = ET.parse(xml_path).getroot()
                     if root.tag == "vocals":
-                        for v in root.findall("vocal"):
-                            lyrics.append({
+                        # Some official DLC ships an empty <vocals/> shell
+                        # alongside the real SNG, so only stop scanning
+                        # when the XML actually produced lyric tokens.
+                        # An empty shell here would otherwise short-circuit
+                        # later XML files (and the SNG fallback below
+                        # checks `if not lyrics:` so it would still try,
+                        # but a meaningful XML further down the rglob
+                        # would be missed). Mirrors the lib helper at
+                        # lib/sloppak_convert.py:_parse_lyrics_with_source.
+                        candidate = [
+                            {
                                 "t": round(float(v.get("time", "0")), 3),
                                 "d": round(float(v.get("length", "0")), 3),
                                 "w": v.get("lyric", ""),
-                            })
-                        break
+                            }
+                            for v in root.findall("vocal")
+                        ]
+                        if candidate:
+                            lyrics = candidate
+                            lyrics_source = "xml"
+                            break
                 except Exception:
                     pass
             if not lyrics:
@@ -3931,97 +4537,242 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
                         except Exception:
                             lyrics = []
                         if lyrics:
+                            lyrics_source = "sng"
                             break
                 except ImportError:
                     pass
         if lyrics:
-            await websocket.send_json({"type": "lyrics", "data": lyrics})
+            payload = {"type": "lyrics", "data": lyrics}
+            if lyrics_source:
+                payload["source"] = lyrics_source
+            await websocket.send_json(payload)
 
-        # Send tone changes (PSARC and loose folders use arrangement XMLs;
-        # sloppak ships tone data inline in its arrangement JSON, no XML).
-        tone_changes = []
+        # Send tone changes. PSARC and loose folders carry tone data in
+        # arrangement XMLs; a sloppak ships it inline in its arrangement JSON
+        # (Arrangement.tones, populated by the converter), so read it straight
+        # off `arr` rather than walking for XML that doesn't exist.
         if is_slop:
-            xml_paths = []
+            # `sloppak_tone_changes` builds the (base, sorted changes) pair
+            # from `Arrangement.tones`, skipping non-string names and
+            # non-finite/non-numeric times — unit-tested in test_tones.py.
+            from tones import sloppak_tone_changes
+            base_name, tone_changes = sloppak_tone_changes(getattr(arr, "tones", None))
+            # Send when there's a base tone OR timed changes — a single-tone
+            # arrangement has a base but no switches, and the highway should
+            # still be able to show the initial tone.
+            if tone_changes or base_name:
+                await websocket.send_json({
+                    "type": "tone_changes",
+                    "base": base_name,
+                    "data": tone_changes,
+                })
         else:
             xml_paths = sorted(_xml_walk("*.xml"))
 
-        # Build tone ID→name map from manifest JSON matching selected arrangement
-        tone_id_map = {}  # {0: "Tone_A_name", 1: "Tone_B_name", ...}
-        arr_name_lower = arr.name.lower() if arr else ""
-        for jf in sorted(_json_walk("*.json")):
-            try:
-                # Prefer manifest matching selected arrangement
-                if arr_name_lower and arr_name_lower not in jf.stem.lower():
-                    continue
-                jdata = json.loads(jf.read_text())
-                for entry in (jdata.get("Entries") or {}).values():
-                    attrs = entry.get("Attributes") or {}
-                    for idx, key in enumerate(["Tone_A", "Tone_B", "Tone_C", "Tone_D"]):
-                        val = attrs.get(key, "")
-                        if val:
-                            tone_id_map[idx] = val
-                    if tone_id_map:
-                        break
-            except Exception:
-                continue
-            if tone_id_map:
-                break
-        # Fallback: try any manifest if arrangement-specific one not found
-        if not tone_id_map:
-            for jf in sorted(_json_walk("*.json")):
+            # Build tone ID→name map from the manifest JSON for the selected
+            # arrangement. Match on the entry's `ArrangementName` field, not a
+            # filename-stem substring — "Lead" is a substring of "Bonus Lead",
+            # so the old substring test could build the map from the wrong
+            # arrangement. Record the matched JSON stem so the XML below can
+            # be paired exactly (RS names the JSON and XML with the same stem).
+            arr_tone_names = {}  # the SELECTED arrangement's own Tone_A..D only
+            matched_stem = None
+            # Strip + lowercase both sides when matching ArrangementName,
+            # mirroring lib/tones.py — a manifest with padded whitespace
+            # must not fall through to an unrelated arrangement.
+            arr_name_lower = arr.name.strip().lower() if arr else ""
+
+            def _manifest_entries(path):
+                """Parsed `Entries` dict for a manifest JSON, or {} if the
+                file isn't a well-formed manifest (non-dict top level /
+                Entries, unparseable JSON)."""
                 try:
-                    jdata = json.loads(jf.read_text())
-                    for entry in (jdata.get("Entries") or {}).values():
-                        attrs = entry.get("Attributes") or {}
-                        for idx, key in enumerate(["Tone_A", "Tone_B", "Tone_C", "Tone_D"]):
-                            val = attrs.get(key, "")
-                            if val:
-                                tone_id_map[idx] = val
-                        if tone_id_map:
-                            break
+                    # JSON is UTF-8; decode strictly so malformed bytes fail
+                    # cleanly (caught below) rather than silently corrupting
+                    # arrangement / tone names.
+                    jdata = json.loads(path.read_text(encoding="utf-8"))
                 except Exception:
-                    continue
-                if tone_id_map:
+                    return {}
+                entries = jdata.get("Entries") if isinstance(jdata, dict) else None
+                return entries if isinstance(entries, dict) else {}
+
+            def _tone_names(attrs):
+                """{idx: name} from an entry's Tone_A..Tone_D — string values
+                only, so a malformed manifest can't emit a non-string name."""
+                m = {}
+                for idx, key in enumerate(("Tone_A", "Tone_B", "Tone_C", "Tone_D")):
+                    val = attrs.get(key)
+                    if isinstance(val, str) and val:
+                        m[idx] = val
+                return m
+
+            for jf in sorted(_json_walk("*.json")):
+                for entry in _manifest_entries(jf).values():
+                    if not isinstance(entry, dict):
+                        continue
+                    attrs = entry.get("Attributes")
+                    if not isinstance(attrs, dict):
+                        continue
+                    ename = attrs.get("ArrangementName")
+                    if not isinstance(ename, str) or ename.strip().lower() != arr_name_lower:
+                        continue
+                    # Only the SELECTED arrangement's own Tone_A..D — never
+                    # borrowed from another manifest. An unrelated map would
+                    # mislabel `N/A` tone-change markers; `Tone {id}` is the
+                    # correct fallback (matching lib/tones.py).
+                    arr_tone_names = _tone_names(attrs)
+                    matched_stem = jf.stem.lower()
+                    break
+                if matched_stem is not None:
                     break
 
-        # Parse XMLs — prefer the one matching selected arrangement, fall back to any
-        # Try arrangement-matching XML first, then fall back to any
-        def _xml_matches_arr(xp):
-            return arr_name_lower and arr_name_lower in xp.stem.lower()
-        sorted_xml = sorted(xml_paths, key=lambda xp: (0 if _xml_matches_arr(xp) else 1, xp.name))
-        for xml_path in sorted_xml:
-            try:
-                root = ET.parse(xml_path).getroot()
-                if root.tag != "song":
-                    continue
-                tones_el = root.find("tones")
-                if tones_el is not None:
-                    for t in tones_el.findall("tone"):
-                        tc_time = t.get("time")
-                        tc_name = t.get("name", "")
-                        tc_id = t.get("id", "")
-                        # Resolve "N/A" or empty names using tone ID map
-                        if (not tc_name or tc_name == "N/A") and tc_id:
-                            tc_name = tone_id_map.get(int(tc_id), f"Tone {tc_id}")
-                        if tc_time and tc_name:
-                            tone_changes.append({
-                                "t": round(float(tc_time), 3),
-                                "name": tc_name,
+            # Parse XMLs. Prefer the XML paired with the matched manifest
+            # (identical stem). When no manifest matched (loose/CDLC), fall
+            # back to a name-token match — but rank by how few *extra* stem
+            # tokens a candidate carries, mirroring lib/tones.py: {"lead"} is
+            # a subset of both `song_lead` and `song_bonus_lead`, so a plain
+            # subset test still ties. A unique fewest-extra match wins; an
+            # exact tie among token candidates is treated as ambiguous —
+            # `_token_ambiguous` then suppresses the rank-2 best-effort
+            # fallback, so no arrangement's tone timeline is guessed at
+            # (matching lib/tones.py, which attaches nothing on a tie).
+            # Shared tokenizer with lib/tones.py so PSARC playback and
+            # PSARC→sloppak conversion select arrangement XMLs identically.
+            from tones import tokens as _name_tokens
+            _arr_tokens = _name_tokens(arr.name) if arr else set()
+            _token_pick = None
+            _token_ambiguous = False
+            if _arr_tokens and matched_stem is None:
+                _cands = []
+                for xp in xml_paths:
+                    stem_tokens = _name_tokens(xp.stem)
+                    if _arr_tokens <= stem_tokens:
+                        _cands.append((len(stem_tokens - _arr_tokens), xp))
+                if _cands:
+                    _best = min(extra for extra, _ in _cands)
+                    _tied = [xp for extra, xp in _cands if extra == _best]
+                    if len(_tied) == 1:
+                        _token_pick = _tied[0]
+                    else:
+                        _token_ambiguous = True
+
+            def _xml_rank(xp):
+                if matched_stem and xp.stem.lower() == matched_stem:
+                    return 0
+                if _token_pick is not None and xp == _token_pick:
+                    return 1
+                return 2
+            sorted_xml = sorted(xml_paths, key=lambda xp: (_xml_rank(xp), xp.name))
+            # When the arrangement was positively identified (manifest stem
+            # pair or a unique token match), tone data must come only from
+            # that XML — a rank-2 fallback XML belongs to another
+            # arrangement. A token tie is likewise suppressed (guessing among
+            # equally-named XMLs would be wrong). Only a genuine no-match
+            # case (loose/CDLC with no usable manifest and no name overlap)
+            # keeps the long-standing rank-2 best-effort source.
+            _suppress_fallback = (
+                matched_stem is not None or _token_pick is not None or _token_ambiguous
+            )
+            sent_tones = False
+            psarc_base = ""  # <tonebase> of the preferred arrangement XML
+            for xml_path in sorted_xml:
+                try:
+                    root = ET.parse(xml_path).getroot()
+                    if root.tag != "song":
+                        continue
+                    if _suppress_fallback and _xml_rank(xml_path) == 2:
+                        # Don't read tones from an unrelated arrangement's XML.
+                        continue
+                    # Capture the base tone from the first XML the loop
+                    # accepts. The skip above already excluded untrusted
+                    # rank-2 XMLs whenever a match was confirmed; in the
+                    # genuine no-match case rank-2 IS the best-effort source,
+                    # so its <tonebase> is equally valid for a base-only song.
+                    if not psarc_base:
+                        _tb = root.find("tonebase")
+                        if _tb is not None and _tb.text:
+                            # Strip whitespace from pretty-printed XML so the
+                            # base name matches the sloppak path, which also
+                            # strips it.
+                            psarc_base = _tb.text.strip()
+                    tones_el = root.find("tones")
+                    if tones_el is not None:
+                        # Accumulate into a per-XML list — if this file
+                        # raises partway through, its partial changes are
+                        # discarded rather than bleeding into the next
+                        # candidate XML.
+                        xml_tone_changes = []
+                        for t in tones_el.findall("tone"):
+                            tc_time = t.get("time")
+                            tc_name = t.get("name", "")
+                            tc_id = t.get("id", "")
+                            # Resolve "N/A" or empty names via the selected
+                            # arrangement's own tone map; `Tone {id}` when it
+                            # has none (never another arrangement's names).
+                            if (not tc_name or tc_name == "N/A") and tc_id:
+                                try:
+                                    tc_name = arr_tone_names.get(int(tc_id), f"Tone {tc_id}")
+                                except (TypeError, ValueError):
+                                    pass
+                            if tc_time and tc_name:
+                                # Skip a single malformed/non-finite marker
+                                # rather than letting it raise — the outer
+                                # `except` would otherwise swallow the whole
+                                # XML and drop every tone change. NaN/inf
+                                # would also produce client-unparseable JSON.
+                                try:
+                                    tc_t = float(tc_time)
+                                except (TypeError, ValueError):
+                                    continue
+                                if not math.isfinite(tc_t):
+                                    continue
+                                xml_tone_changes.append({
+                                    "t": round(tc_t, 3),
+                                    "name": tc_name,
+                                })
+                        if xml_tone_changes:
+                            tonebase = root.find("tonebase")
+                            base_name = tonebase.text.strip() if tonebase is not None and tonebase.text else ""
+                            # If base name not in XML, use the selected
+                            # arrangement's own Tone_A.
+                            if not base_name:
+                                base_name = arr_tone_names.get(0, "")
+                            await websocket.send_json({
+                                "type": "tone_changes",
+                                "base": base_name,
+                                "data": sorted(xml_tone_changes, key=lambda x: x["t"]),
                             })
-                    if tone_changes:
-                        tonebase = root.find("tonebase")
-                        base_name = tonebase.text if tonebase is not None and tonebase.text else ""
-                        # If base name not in XML, use Tone_A from tone_id_map (same arrangement)
-                        if not base_name:
-                            base_name = tone_id_map.get(0, "")
-                        await websocket.send_json({
-                            "type": "tone_changes",
-                            "base": base_name,
-                            "data": sorted(tone_changes, key=lambda x: x["t"]),
-                        })
-                        break
-            except Exception:
-                pass
+                            sent_tones = True
+                            break
+                except (ET.ParseError, OSError) as e:
+                    # Only swallow unreadable/malformed XML — skip to the next
+                    # candidate. A blanket `except` here would also eat a
+                    # `WebSocketDisconnect` from `send_json`; let that bubble
+                    # to the handler's outer disconnect handler.
+                    log.debug(
+                        "highway: skipping unreadable arrangement XML %s: %s",
+                        xml_path.name, e,
+                    )
+                    continue
+            # Base-only fallback: a single-tone arrangement has a <tonebase>
+            # but no <tones> markers — still surface the initial tone so the
+            # highway can show it (parity with the sloppak path above).
+            # `psarc_base` is the <tonebase> of whichever XML the loop
+            # accepted: the confirmed-match XML, or — in the genuine no-match
+            # case — the best-effort rank-2 XML. `arr_tone_names` holds the
+            # selected arrangement's own Tone_A..D. An ambiguous arrangement
+            # (token tie) accepts no XML and has no manifest map, so it
+            # correctly sends nothing rather than a guessed tone.
+            if not sent_tones:
+                base_name = psarc_base
+                if not base_name:
+                    base_name = arr_tone_names.get(0, "")
+                if base_name:
+                    await websocket.send_json({
+                        "type": "tone_changes",
+                        "base": base_name,
+                        "data": [],
+                    })
 
         # Send notes in chunks
         notes = [note_to_wire(n) for n in arr.notes]

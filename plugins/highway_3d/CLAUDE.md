@@ -11,7 +11,7 @@ The whole plugin is **one file** — `screen.js`, wrapped in an IIFE, registered
 The file is laid out top-to-bottom as:
 
 1. **Constants block** — palette (`S_COL`), scale (`SCALE`, `K`), fret/string counts, geometry sizes, camera, fog
-2. **Pure helpers** — `bendText`, `fretX`, `fretMid`, `dZ`, `computeBPM`
+2. **Pure helpers** — `fretX`, `fretMid`, `dZ`, `computeBPM`
 3. **Three.js loader** — `loadThree()` (loads vendored `/static/vendor/three/three.module.min.js`, memoized)
 4. **Splitscreen helpers** — `_ssActive`, `_ssIsCanvasFocused` (read `window.slopsmithSplitscreen`)
 5. **`createFactory()`** — the rest of the file is one big closure
@@ -82,7 +82,7 @@ Each entry names the function or banner you should grep for, plus key sub-blocks
 - **Sustain trail** → `// ── Sustain trail ──` block in `drawNote()`. Geometry: scaled `gSus` (`BoxGeometry(1,1,1)`). Width `NW * 0.85`, height `NH * 0.12`. Outline mesh + colored core mesh.
 - **Lane drop line** → `// ── Lane drop line ──` block in `drawNote()`. Vertical line from each upcoming note down to the fretboard plane in the string's color.
 - **Per-note fret connector label** → `// ── Per-note fret connector label ──` block in `drawNote()`. Number below the board with a thin line up to the note. Be careful with `replace_all` on the `0.5` and `0.4` floats in the alpha formula — they're separate constants. Uses the `'noteFret'` preset in `TXT_STYLES` (also applied to the on-body fret number when `showFretOnNote` is enabled).
-- **Technique labels** (bend, slide, hammer/pull/tap, accent, tremolo, palm-mute, pinch harmonic) → `// ── Technique labels ──` block in `drawNote()`. Each is a small if-block; `txtMat(text, color, wide, style)` is the cached sprite-material helper. The `'technique'` preset in `TXT_STYLES` controls font/outline/shadow for these — see "Tweaking text-sprite styling".
+- **Technique markers** (bend, slide, hammer/pull/tap, accent, tremolo, palm-mute, pinch harmonic) → `// ── Technique labels ──` block in `drawNote()`. Most are small if-blocks using `txtMat(text, color, wide, style)` (cached sprite material; `'technique'` preset in `TXT_STYLES`). Exceptions: a **bend** draws a string-coloured chevron strength stack (`bendChevronMat`, one chevron per half-step), and **hammer-on / pull-off** draw a white ▲/▼ triangle with a string-coloured border (`triMat`) — both pinned to the gem; the bend ribbon's up→hold→down contour is driven by `bendSemisAtTime`.
 - **Open-string note** → special-cased throughout `drawNote()`: `n.f === 0`. Wider/flatter geometry, "0" label sprite, uses `openX` (the chord's open-string centroid) when supplied.
 - **Board projection ("ghost" preview)** → `// ── Board projection ──` block in `drawNote()`. Two meshes per string (`projMeshArr`, `projGlowArr`), one visible per frame for the next note. Linger window `PROJ_WIN`. Gated on the `projectionVisible` setting (BG_DEFAULTS / `h3dBgSetProjectionVisible` / the "Show note preview on the fretboard" checkbox in `settings.html`) — when off, the block is skipped and `update()`'s per-frame `m.visible = false` reset leaves the ghost hidden. **The glow has `renderOrder = -1`** which fights the strings — see Pitfall #6.
 - **Note-hit "sizzle" (slopsmith#254)** → `drawNotedetectSizzle()` (called from the `lyricsCtx` block in `draw()`, just before `drawNotedetectLabels()`). For each confirmed hit/active note (`_ndGood` in `drawNote()` pushes `{x, y, z, s, alpha, color}` onto the per-frame `_ndSizzle` array — `alpha` is the provider's clamped fade, `color` an optional palette override), it projects the note's world point through the up-to-date `cam`, sizes the burst from a fretboard-X-axis offset projection (reliable even when the note's rotated flat at the line), and twinkles a few short crackling ellipse-arc segments + tiny dots hugging the note's rectangle — re-randomised every frame, contained to ≲1.4× the note, half white / half the string colour (or the provider's `color` when given). Every dot/arc's `globalAlpha` and `shadowBlur` are scaled by the entry's `alpha`, and the per-element "off-this-frame" probability rises as `alpha` decays, so a struck-note glow visibly thins and fades. Also: `_ndGood` swaps the note's outline to `mGlow[s]` (bright string-tinted, not green). Knobs are inline: arc/dot count, base on-probability, line widths, `shadowBlur`, spread radii. Lives entirely on the 2D overlay layer — no Three.js geometry/disposal.
@@ -119,6 +119,13 @@ Each entry names the function or banner you should grep for, plus key sub-blocks
 - **Focus dim** → `_isFocused` flag, manipulated by `_updateFocusState()`. Fades ambient + directional light intensity in non-focused panels.
 - **Per-panel resize fallback** → search `_lastHwW` in the returned `draw()`. The renderer self-detects when the highway canvas backing-store dimensions change and re-runs `applySize()`. Needed because the splitscreen plugin overrides `hw.resize` and never calls `renderer.resize()`.
 - **Reduced DPR in split** → `applySize()` clamps DPR to 1.25 when splitscreen is active vs 2 otherwise (search `baseDPR`). Keeps four-panel quad layout from melting GPUs.
+
+### Splitscreen panel controls/settings
+- Per-panel background overrides use `localStorage` keys shaped as `h3d_bg_panel<N>_<key>`. When present, they override the global `h3d_bg_<key>` value for panel `N`; when absent, the global value still applies.
+- Keep per-panel keys to `BG_DEFAULTS` entries that `_bgLoadSettings()` reads. Do not add panel-only keys outside that load path.
+- `panelControls` is a static, host-readable, curated descriptor list for controls a host can expose per panel. It documents the supported per-panel surface; the renderer still loads values through `_bgLoadSettings()`.
+- Asset/background image keys remain global-only. Do not make uploaded or selected asset references panel-scoped unless that contract is explicitly widened.
+- Host refresh nudges that call toggle setters must pass real booleans, not strings such as `'false'`, so setters can distinguish `true` from `false`.
 
 ## The `bundle` object
 

@@ -53,14 +53,34 @@ function _applySongVolume(v) {
     _songVolumeMemory = normalized;
     const a = _audioEl();
     if (a) a.volume = normalized / 100;
-    // Desktop + JUCE: song audio is mixed in the native engine; HTML5 volume is ignored.
     const linear = normalized / 100;
+    // Multi-stem sloppak: the stems plugin mutes the core <audio> element and
+    // routes every stem through its own master GainNode, so a.volume above is
+    // dead. Drive that master instead when the stems plugin has published its
+    // hook (it clears the hook on teardown for PSARC / stem-less songs).
+    const stemsSetMaster = window.slopsmith?.stems?.setMasterVolume;
+    if (typeof stemsSetMaster === 'function') {
+        // A synchronous throw or a rejected Promise from the stems plugin hook
+        // must not abort _applySongVolume before it returns / persists. The
+        // try/catch covers a sync throw; the .catch() covers an async rejection.
+        try {
+            // `void` marks the floating Promise as intentionally discarded,
+            // consistent with the other ignored async calls in this module.
+            void Promise.resolve(stemsSetMaster(linear))
+                .catch(function () { /* stems hook unavailable */ });
+        } catch (_) { /* stems hook unavailable */ }
+    }
+    // Desktop + JUCE: song audio is mixed in the native engine; HTML5 volume is ignored.
     if (window._juceMode) {
         const setGain = window.slopsmithDesktop?.audio?.setGain;
         if (typeof setGain === 'function') {
-            return Promise.resolve(setGain('backing', linear))
-                .catch(function () { /* IPC unavailable */ })
-                .then(function () { return normalized; });
+            // Same dual guard as the stems hook above: the try/catch covers a
+            // synchronous throw from setGain, the .catch() covers a rejected IPC.
+            try {
+                return Promise.resolve(setGain('backing', linear))
+                    .catch(function () { /* IPC unavailable */ })
+                    .then(function () { return normalized; });
+            } catch (_) { /* IPC unavailable */ }
         }
     }
     return Promise.resolve(normalized);
@@ -170,6 +190,7 @@ function _strip(spec) {
     slider.step = String(spec.step);
     slider.value = String(cur);
     slider.setAttribute('aria-label', spec.label + ' volume');
+    window.handleSliderInput?.(slider); //initialize the slider's background fill based on the initial value
 
     const valueEl = document.createElement('span');
     valueEl.className = 'mixer-strip-value';
@@ -207,6 +228,7 @@ function _strip(spec) {
         actual = _clampToSpec(actual, spec);
         cur = actual;
         slider.value = String(actual);
+        window.handleSliderInput?.(slider); //update the slider's background fill on input
         valueEl.textContent = _formatValue(actual, spec.unit);
     });
 

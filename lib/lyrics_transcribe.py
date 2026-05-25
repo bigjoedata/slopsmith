@@ -209,24 +209,22 @@ def _whisperx_to_sloppak(aligned: dict, min_score: float) -> list[dict]:
     Times are rounded to 3 decimals to match the convention in
     `sloppak_convert.py:_parse_lyrics()`."""
     out: list[dict] = []
+    # `prev_end` tracks the actual end of the last processed segment
+    # (NOT the last surviving word), so the gap heuristic measures
+    # against real audio timing. Segments whose only words get filtered
+    # out still advance the cursor — otherwise the next segment's gap
+    # would falsely measure all the way back to whatever survived
+    # several segments ago.
     prev_end: float | None = None
-    pending_line_break = False
     for segment in aligned.get("segments", []) or []:
         words = segment.get("words") or []
-        if not words:
-            continue
-        # Flag a line break when the gap between this segment and the
-        # previous one is comfortably large. We don't emit it yet — we
-        # need to wait until the previous segment's last surviving word
-        # is in `out` so we can suffix `+` onto it.
-        first_start = words[0].get("start")
-        if (
-            prev_end is not None
-            and isinstance(first_start, (int, float))
-            and (first_start - prev_end) > _LINE_BREAK_GAP_SECONDS
-        ):
-            pending_line_break = True
-        last_end_in_seg: float | None = None
+        # Walk every word, regardless of whether it survives the
+        # confidence filter, so we can apply the line-break heuristic
+        # at the moment we actually emit a syllable. Doing the gap
+        # check at emit time (vs. once per segment) means a segment
+        # whose entire word list gets filtered can't strand a "pending"
+        # break that fires against an unrelated syllable in a later
+        # segment.
         for w in words:
             text = (w.get("word") or "").strip()
             if not text:
@@ -242,22 +240,42 @@ def _whisperx_to_sloppak(aligned: dict, min_score: float) -> list[dict]:
                 continue
             if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
                 continue
-            # Apply the pending line break by appending `+` to the
-            # previous syllable's text. Cleared once consumed so we
-            # don't double-suffix the same break across segments.
-            if pending_line_break and out:
-                if not out[-1]["w"].endswith("+"):
-                    out[-1]["w"] = out[-1]["w"] + "+"
-                pending_line_break = False
+            # Line break: suffix `+` on the previous emitted syllable
+            # if there's a comfortably large silence between the last
+            # processed-segment cursor and the current surviving word.
+            # Anchoring on `prev_end` (segment end), not `out[-1]`'s
+            # actual end, keeps the heuristic aligned with real audio
+            # timing — a long mid-segment pause within one phrase
+            # shouldn't force a break, and a trailing-words-filtered
+            # segment shouldn't falsely inflate the gap to the next one.
+            if (
+                prev_end is not None
+                and (float(start) - prev_end) > _LINE_BREAK_GAP_SECONDS
+                and out
+                and not out[-1]["w"].endswith("+")
+            ):
+                out[-1]["w"] = out[-1]["w"] + "+"
             duration = max(_MIN_WORD_DURATION, float(end) - float(start))
             out.append({
                 "t": round(float(start), 3),
                 "d": round(duration, 3),
                 "w": text,
             })
-            last_end_in_seg = float(end)
-        if last_end_in_seg is not None:
-            prev_end = last_end_in_seg
+        # Advance `prev_end` to the segment's actual end (or the latest
+        # numeric word end if the segment lacks an `end`). This runs
+        # for every segment — even empty / fully-filtered ones — so
+        # the next segment's gap measurement reflects real audio
+        # timing regardless of survivorship.
+        seg_end = segment.get("end")
+        if isinstance(seg_end, (int, float)):
+            prev_end = float(seg_end)
+        else:
+            word_ends = [
+                float(w["end"]) for w in words
+                if isinstance(w.get("end"), (int, float))
+            ]
+            if word_ends:
+                prev_end = max(word_ends)
     return out
 
 

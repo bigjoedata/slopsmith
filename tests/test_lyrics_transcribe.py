@@ -156,6 +156,57 @@ def test_mapper_skips_empty_word_text():
     assert [w["w"] for w in got] == ["real"]
 
 
+def test_mapper_gap_anchors_on_segment_end_not_last_surviving_word():
+    # Trailing word of segment 1 gets filtered (low score). prev_end must
+    # still advance to the segment's real end, otherwise the gap to
+    # segment 2 measures from "first" (1.2s) to "second" (3.0s) = 1.8s
+    # and falsely triggers a `+` line break. The segment's actual end
+    # is 5.0s, so gap is 3.0 - 5.0 = -2s, no break.
+    aligned = {
+        "segments": [
+            {
+                "end": 5.0,
+                "words": [
+                    {"word": "first", "start": 1.0, "end": 1.2, "score": 0.9},
+                    {"word": "dropped", "start": 4.5, "end": 5.0, "score": 0.05},
+                ],
+            },
+            {
+                "words": [
+                    {"word": "second", "start": 3.0, "end": 3.3, "score": 0.9},
+                ],
+            },
+        ],
+    }
+    got = _whisperx_to_sloppak(aligned, min_score=0.35)
+    # Only "first" + "second" survive the filter, no `+` suffix.
+    assert got == [
+        {"t": 1.0, "d": 0.2, "w": "first"},
+        {"t": 3.0, "d": 0.3, "w": "second"},
+    ]
+
+
+def test_mapper_advances_prev_end_past_fully_filtered_segment():
+    # Entire middle segment gets filtered out, but prev_end must still
+    # advance past it via segment.end. Otherwise the gap from "first"
+    # (end 1.2s) to "third" (start 8.0s) registers as 6.8s and triggers
+    # a `+` break against "first" — wrong, the actual gap from the
+    # filtered segment's true end (7.5s) to "third" (8.0s) is 0.5s.
+    aligned = {
+        "segments": [
+            {"end": 1.5, "words": [{"word": "first", "start": 1.0, "end": 1.2, "score": 0.9}]},
+            {"end": 7.5, "words": [{"word": "dropped", "start": 5.0, "end": 7.5, "score": 0.05}]},
+            {"words": [{"word": "third", "start": 8.0, "end": 8.4, "score": 0.9}]},
+        ],
+    }
+    got = _whisperx_to_sloppak(aligned, min_score=0.35)
+    # No `+` suffix on "first" — short gap to the third segment.
+    assert got == [
+        {"t": 1.0, "d": 0.2, "w": "first"},
+        {"t": 8.0, "d": 0.4, "w": "third"},
+    ]
+
+
 def test_mapper_handles_empty_input():
     assert _whisperx_to_sloppak({}, min_score=0.0) == []
     assert _whisperx_to_sloppak({"segments": []}, min_score=0.0) == []

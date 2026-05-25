@@ -166,11 +166,16 @@ def vocals_has_signal(vocals_path: Path, threshold: float = 0.005) -> bool:
 # ── Output mapping ───────────────────────────────────────────────────────────
 
 # Gap (in seconds) between WhisperX segments that triggers a `+` line break
-# syllable in the sloppak output. Matches the "comfortable visual pause"
-# threshold used in TabGrabber. Tighter gaps (between phrases of a single
-# verse line) stay on the same line; longer gaps (verse → chorus, etc.)
-# get a break so the in-app lyrics overlay can wrap them.
-_LINE_BREAK_GAP_SECONDS = 1.5
+# syllable in the sloppak output. Bumped from 1.5s (TabGrabber's value) to
+# 3.0s after seeing the lower threshold produce short-burst phrasing on
+# sung material — singers breathe at ~0.5-1.5s between phrases of the
+# same verse, so the tighter cutoff fragmented every line into a few
+# words. 3.0s captures stanza-level pauses (verse→chorus, end-of-bridge)
+# while keeping intra-line breaths grouped on one rendered line. The
+# highway renderer still has its own 4.0s safety fallback (see
+# static/highway.js) that forces a wrap regardless, so this only
+# controls when WE author breaks vs delegating to the renderer.
+_LINE_BREAK_GAP_SECONDS = 3.0
 
 # Floor on per-word duration in the sloppak output. WhisperX occasionally
 # emits zero-length words for very short syllables; the highway overlay's

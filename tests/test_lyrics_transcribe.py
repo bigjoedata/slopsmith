@@ -99,7 +99,7 @@ def test_mapper_inserts_line_break_on_segment_gap_above_threshold():
 
 
 def test_mapper_does_not_insert_line_break_for_close_segments():
-    # Gap of 0.5s — well under the 1.5s threshold, no break syllable.
+    # Gap of 0.5s — well under the threshold, no break syllable.
     aligned = {
         "segments": [
             {"words": [{"word": "a", "start": 1.0, "end": 1.2, "score": 0.9}]},
@@ -108,6 +108,21 @@ def test_mapper_does_not_insert_line_break_for_close_segments():
     }
     got = _whisperx_to_sloppak(aligned, min_score=0.0)
     assert [w["w"] for w in got] == ["a", "b"]
+
+
+def test_mapper_no_line_break_for_singer_breath_gap():
+    # Gap of 2.0s — typical between-phrase singer breath on slow vocals.
+    # Pinned behavior: must NOT trigger a `+` break (would fragment a
+    # verse into one-line-per-phrase). The old 1.5s threshold would
+    # have broken here; the current 3.0s default leaves it intact.
+    aligned = {
+        "segments": [
+            {"words": [{"word": "phrase1", "start": 1.0, "end": 1.5, "score": 0.9}]},
+            {"words": [{"word": "phrase2", "start": 3.5, "end": 4.0, "score": 0.9}]},
+        ],
+    }
+    got = _whisperx_to_sloppak(aligned, min_score=0.0)
+    assert [w["w"] for w in got] == ["phrase1", "phrase2"]
 
 
 def test_mapper_clamps_zero_duration_to_floor():

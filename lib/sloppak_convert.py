@@ -989,13 +989,16 @@ def _rewrite_lyrics_manifest(
 def _load_lyrics_for_pitch(lyrics_path: Path) -> list[dict] | None:
     """Load an existing lyrics JSON for pitch extraction's purposes.
 
-    The pitch endpoint only needs each entry's `t` + `d`; the rest of
-    the lyrics shape (word text, formatting hints, etc.) is forwarded
-    unchanged but ignored server-side. So this loader's bar is low:
-    return a list of dicts that each have `t` + `d`. Any other shape
-    (missing fields, top-level non-list, malformed JSON, IO error)
-    returns None so the caller skips the pitch hand-off rather than
-    crashing the surrounding transcription pass.
+    The pitch endpoint only needs each entry's `t` + `d` (and rejects
+    non-numeric values server-side with a 4xx); the rest of the lyrics
+    shape (word text, formatting hints, etc.) is forwarded unchanged
+    but ignored. So this loader's bar is: return a list of dicts that
+    each have a numeric `t` + numeric `d`. Bools are excluded
+    explicitly because `isinstance(True, int)` is True in Python and
+    the endpoint would reject them. Any other shape (missing fields,
+    wrong types, top-level non-list, malformed JSON, IO error) returns
+    None so the caller skips the pitch hand-off rather than crashing
+    the surrounding transcription pass.
 
     NOT a manifest reader — caller has already resolved the path via
     `_existing_lyrics_path`. NOT a general lyrics validator — the
@@ -1011,7 +1014,11 @@ def _load_lyrics_for_pitch(lyrics_path: Path) -> list[dict] | None:
     for entry in raw:
         if not isinstance(entry, dict):
             continue
-        if "t" not in entry or "d" not in entry:
+        t = entry.get("t")
+        d = entry.get("d")
+        if isinstance(t, bool) or isinstance(d, bool):
+            continue
+        if not isinstance(t, (int, float)) or not isinstance(d, (int, float)):
             continue
         out.append(entry)
     return out or None
@@ -1286,11 +1293,18 @@ def _maybe_extract_pitch(
 ) -> bool:
     """Per-syllable pitch extraction via the demucs server's /pitch endpoint.
 
-    Best-effort sibling to `_maybe_transcribe_lyrics`. Fires when:
+    Best-effort sibling to `_maybe_transcribe_lyrics`. Called from
+    both the WhisperX success path and the existing-lyrics short-
+    circuit inside `_maybe_transcribe_lyrics`, so the vocals gate
+    below is enforced here rather than assumed from a single caller.
+    Fires when:
       1. `pitch_extraction.enabled` is True in converter config.
-      2. We have a vocal stem on disk (caller guarantees this — we're
-         called right after `_maybe_transcribe_lyrics` succeeded).
-      3. We have at least one lyric token (the endpoint needs timings).
+      2. There is at least one lyric token (the endpoint needs
+         timings — either freshly produced by WhisperX or loaded from
+         an existing on-disk lyrics file via `_load_lyrics_for_pitch`).
+      3. The vocal stem exists on disk (defensive — both production
+         call sites have already checked this, but tests + future
+         callers may not).
       4. A server URL is configured (either `pitch_extraction.server_url`
          or the shared `demucs_server_url`). Local CREPE is deferred.
 

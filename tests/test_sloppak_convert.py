@@ -858,6 +858,26 @@ def test_load_lyrics_for_pitch_returns_none_when_all_entries_filtered(tmp_path):
     assert sloppak_convert._load_lyrics_for_pitch(p) is None
 
 
+def test_load_lyrics_for_pitch_filters_non_numeric_t_or_d(tmp_path):
+    """The /pitch endpoint rejects non-numeric t/d server-side with a 4xx;
+    filter those out client-side so we don't waste a round-trip and so the
+    happy path's "got N notes" log line reflects what's actually plausible."""
+    p = tmp_path / "lyrics.json"
+    p.write_text(_json.dumps([
+        {"t": 0.0, "d": 0.5, "w": "ok"},
+        {"t": "0.0", "d": 0.5, "w": "string-t"},   # filtered (string)
+        {"t": 1.0, "d": None, "w": "none-d"},      # filtered (None)
+        {"t": True, "d": 0.5, "w": "bool-t"},      # filtered (bool — int subclass but server rejects)
+        {"t": 0.0, "d": False, "w": "bool-d"},     # filtered
+        {"t": 2, "d": 1, "w": "int-ok"},           # kept (int IS numeric)
+    ]), encoding="utf-8")
+    out = sloppak_convert._load_lyrics_for_pitch(p)
+    assert out == [
+        {"t": 0.0, "d": 0.5, "w": "ok"},
+        {"t": 2, "d": 1, "w": "int-ok"},
+    ]
+
+
 def test_maybe_transcribe_lyrics_runs_pitch_when_lyrics_already_exist(tmp_path, monkeypatch):
     """When a sloppak ships with lyrics (PSARC xml/sng or hand-authored),
     WhisperX skips — but the pitch path should STILL run since the

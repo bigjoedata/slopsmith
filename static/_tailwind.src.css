@@ -1,0 +1,6 @@
+/* Tailwind CSS input file consumed by `bash scripts/build-tailwind.sh`.
+   The generated artifact is `static/tailwind.min.css`, served as a
+   plain stylesheet. Do not edit the generated file by hand. */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;

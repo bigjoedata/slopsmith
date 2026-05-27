@@ -158,9 +158,80 @@ function createHighway() {
     let _chordFretLineNotes = [];  // notes to render on fret line
     const _frameMismatchWarned = new Set();  // chord ids already warned about (slopsmith#88)
     // Per-chord render info, computed lazily once per src array (slopsmith#88).
-    const _chordRenderInfo = new WeakMap();  // chord -> { chainIndex, chainLen, isFull, baseFret }
+    const _chordRenderInfo = new WeakMap();  // chord -> { chainIndex, chainLen, isFull, baseFret, sortedNotes, nonZeroNotes, nonZeroFrets, allMuted, hasMultipleNotes }
     let _chordRenderCacheSrc = null;
     let _chordRenderCacheInverted = null;
+    // Also invalidate when chordTemplates is reassigned (WS 'chord_templates'
+    // can land AFTER 'chords' chunks, and `isOpen(cn)` — used to compute
+    // cached nonZeroNotes/nonZeroFrets — depends on the template lookup).
+    let _chordRenderCacheTemplates = null;
+
+    // Frame counter for cheap deterministic "random" lookups (sustain
+    // shimmer). Incremented once per rAF in draw().
+    let _frameIdx = 0;
+
+    // 64-entry precomputed jitter LUT replacing Math.random() in the
+    // lit-sustain shimmer hot path (drawSustains). Visually
+    // indistinguishable from per-frame Math.random at rAF cadence,
+    // allocation-free, and removes 4 RNG calls per visible lit sustain
+    // per frame on dense charts. Seeded deterministically (xorshift32)
+    // so the LUT itself is identical across `createHighway()` instances
+    // — shimmer is therefore reload-stable and test-reproducible PER
+    // instance for a given (frameIdx, n.s, n.t) seed. The seed includes
+    // closure-scope `_frameIdx` which is per-instance, so two
+    // splitscreen highways with different rAF cadence will shimmer
+    // differently at any given wall-clock moment; what's stable is the
+    // LUT contents.
+    //
+    // _SHIMMER_LUT_SIZE MUST stay a power of two — `_shimmerNoise`
+    // indexes with `& (_SHIMMER_LUT_SIZE - 1)` for the cheap modulo.
+    const _SHIMMER_LUT_SIZE = 64;
+    const _shimmerLut = new Float32Array(_SHIMMER_LUT_SIZE);
+    for (let i = 0; i < _SHIMMER_LUT_SIZE; i++) {
+        let x = (i + 1) | 0;       // +1 dodges the all-zero xorshift trap
+        x ^= x << 13;
+        x ^= x >>> 17;
+        x ^= x << 5;
+        _shimmerLut[i] = (x >>> 0) / 4294967296;
+    }
+    function _shimmerNoise(seed) {
+        // Mask works only because _SHIMMER_LUT_SIZE is a power of two
+        // (see comment at the LUT declaration above).
+        return _shimmerLut[(seed >>> 0) & (_SHIMMER_LUT_SIZE - 1)];
+    }
+
+    // Memoize ctx.measureText() for the lyric overlay. Per-syllable
+    // measurement was the dominant cost in dense karaoke charts; text
+    // and fontSize are the only inputs (font face string is constant
+    // `bold ${fontSize}px sans-serif`). Two-level Map (outer: fontSize,
+    // inner: text) so a cache hit avoids the `fontSize + '|' + text`
+    // concat that previously allocated on every lookup.
+    //
+    // Bounded on BOTH levels: window resizes change `fontSize`, so each
+    // resize creates a fresh inner Map; without an outer cap, the cache
+    // would retain every fontSize ever rendered for the page lifetime.
+    // Cap outer at 16 distinct fontSize buckets (more than enough — a
+    // session typically sees one or two), inner at 4096 entries per
+    // bucket. Clear-on-overflow on both — a karaoke cold start re-warms
+    // in one frame.
+    const _LYRIC_MEASURE_OUTER_MAX = 16;
+    const _LYRIC_MEASURE_INNER_MAX = 4096;
+    const _lyricMeasureCache = new Map();   // Map<fontSize, Map<text, width>>
+    function _measureLyricText(c, fontSize, text) {
+        let inner = _lyricMeasureCache.get(fontSize);
+        if (inner === undefined) {
+            if (_lyricMeasureCache.size >= _LYRIC_MEASURE_OUTER_MAX) _lyricMeasureCache.clear();
+            inner = new Map();
+            _lyricMeasureCache.set(fontSize, inner);
+        }
+        let w = inner.get(text);
+        if (w === undefined) {
+            if (inner.size >= _LYRIC_MEASURE_INNER_MAX) inner.clear();
+            w = c.measureText(text).width;
+            inner.set(text, w);
+        }
+        return w;
+    }
 
     // Rendering config
     const VISIBLE_SECONDS = 3.0;
@@ -912,6 +983,7 @@ function createHighway() {
     function draw() {
         animFrame = requestAnimationFrame(draw);
         if (!canvas || !_renderer) return;
+        _frameIdx = (_frameIdx + 1) | 0;
         // Visibility-aware skip (#246). Run BEFORE the !ready bail so
         // hide/show transitions during the loading / reconnect window
         // still propagate to listeners (a splitscreen-driven hide that
@@ -1367,11 +1439,18 @@ function createHighway() {
             if (litTrail) {
                 const a = ns.alpha;
                 const col = ns.color || STRING_BRIGHT[n.s] || STRING_COLORS[n.s] || '#666';
+                // Per-note seed so neighbouring sustains shimmer
+                // independently. Math.floor(n.t * 60) is stable across
+                // frames yet drifts on song progression; combined with
+                // _frameIdx + n.s it gives a non-correlated walk through
+                // the LUT, matching the original visual intent
+                // (slopsmith#254 comment above).
+                const seedBase = (_frameIdx + n.s + ((n.t * 60) | 0)) | 0;
                 ctx.save();
                 ctx.fillStyle = col;
                 ctx.shadowColor = col;
-                ctx.shadowBlur = (8 + 6 * Math.random()) * a;          // shimmering glow
-                ctx.globalAlpha = (0.45 + 0.45 * a) * (0.78 + 0.22 * Math.random());
+                ctx.shadowBlur = (8 + 6 * _shimmerNoise(seedBase)) * a;          // shimmering glow
+                ctx.globalAlpha = (0.45 + 0.45 * a) * (0.78 + 0.22 * _shimmerNoise(seedBase + 17));
                 ctx.beginPath();
                 ctx.moveTo(x0 - sw0, y0);
                 ctx.lineTo(x0 + sw0, y0);
@@ -1382,7 +1461,7 @@ function createHighway() {
                 // the trail, re-randomised each frame.
                 ctx.shadowBlur = 0;
                 ctx.globalCompositeOperation = 'lighter';
-                ctx.globalAlpha = a * (0.55 + 0.45 * Math.random());
+                ctx.globalAlpha = a * (0.55 + 0.45 * _shimmerNoise(seedBase + 31));
                 ctx.strokeStyle = '#ffffff';
                 ctx.lineWidth = Math.max(1.5, sw0 * 0.5);
                 ctx.lineJoin = 'round';
@@ -1391,7 +1470,7 @@ function createHighway() {
                 const segs = 7;
                 for (let k = 0; k <= segs; k++) {
                     const f = k / segs;
-                    const jx = (k === 0 || k === segs) ? 0 : (Math.random() - 0.5) * sw0 * 2.2;
+                    const jx = (k === 0 || k === segs) ? 0 : (_shimmerNoise(seedBase + 47 + k) - 0.5) * sw0 * 2.2;
                     const xx = x0 + (x1 - x0) * f + jx;
                     const yy = y0 + (y1 - y0) * f;
                     if (k === 0) ctx.moveTo(xx, yy); else ctx.lineTo(xx, yy);
@@ -1535,17 +1614,15 @@ function createHighway() {
             if (!p) continue;
 
             const info = _chordRenderInfo.get(ch);
-            const { isFull, baseFret } = info;
+            const { isFull, baseFret, sortedNotes: sorted, nonZeroNotes, nonZeroFrets, allMuted, hasMultipleNotes } = info;
 
-            const sorted = [...ch.notes].sort((a, b) => _inverted ? b.s - a.s : a.s - b.s);
             const sz = Math.max(10, 28 * p.scale * (H / 900));
             const spread = sz * 0.85;
             const minSpread = sz + 16 * p.scale;
             const actualSpread = Math.max(spread, minSpread);
             const actualTotalH = actualSpread * Math.max(0, sorted.length - 1);
 
-            const { tmpl, getTemplateFret, isOpen } = getChordTemplateInfo(ch.id, chordTemplates);
-            const nonZeroNotes = sorted.filter(cn => !isOpen(cn));
+            const { tmpl, getTemplateFret } = getChordTemplateInfo(ch.id, chordTemplates);
             const hasNonZero = nonZeroNotes.length >= 1;
 
             const frameLeftFret = baseFret;
@@ -1553,19 +1630,28 @@ function createHighway() {
 
             // Frame validation — log once per chord id rather than every frame.
             if (hasNonZero && !_frameMismatchWarned.has(ch.id)) {
-                const notesInFrame = nonZeroNotes.every(cn => cn.f >= frameLeftFret && cn.f <= frameRightFret);
+                let notesInFrame = true;
+                for (let k = 0; k < nonZeroFrets.length; k++) {
+                    const f = nonZeroFrets[k];
+                    if (f < frameLeftFret || f > frameRightFret) { notesInFrame = false; break; }
+                }
                 if (!notesInFrame) {
                     _frameMismatchWarned.add(ch.id);
-                    console.warn('Chord frame mismatch:', ch.id, { frameLeftFret, frameRightFret, nonZeroFrets: nonZeroNotes.map(cn => cn.f) });
+                    console.warn('Chord frame mismatch:', ch.id, { frameLeftFret, frameRightFret, nonZeroFrets });
                 }
             }
 
-            // X span between fretted notes (excluding open strings)
-            const xMin = hasNonZero ? Math.min(...nonZeroNotes.map(cn => fretX(cn.f, p.scale, W))) : null;
-            const xMax = hasNonZero ? Math.max(...nonZeroNotes.map(cn => fretX(cn.f, p.scale, W))) : null;
-
-            // Muted chord (all notes muted): draw empty gray frame with X
-            const allMuted = sorted.length > 0 && sorted.every(cn => cn.mt);
+            // X span between fretted notes (excluding open strings) —
+            // single pass over cached nonZeroFrets, no spread + Math.min/max.
+            let xMin = null, xMax = null;
+            if (hasNonZero) {
+                xMin = Infinity; xMax = -Infinity;
+                for (let k = 0; k < nonZeroFrets.length; k++) {
+                    const x = fretX(nonZeroFrets[k], p.scale, W);
+                    if (x < xMin) xMin = x;
+                    if (x > xMax) xMax = x;
+                }
+            }
             if (allMuted) {
                 const { boxX, boxW, boxTop, boxH } = _computeChordBox(p, H, W, sorted, sz, actualSpread, baseFret);
 
@@ -1644,10 +1730,13 @@ function createHighway() {
 
             // Notes — wide colored bar for open strings inside a chord,
             // normal note glyph otherwise.
-            const chordPositions = [];
-            const hasMultipleNotes = sorted.length >= 2;
+            // Classify into bent / unbent arrays inline (was: post-filter
+            // chordPositions twice into bent/unbent).
+            const bent = [];
+            const unbent = [];
 
-            sorted.forEach((cn, j) => {
+            for (let j = 0; j < sorted.length; j++) {
+                const cn = sorted[j];
                 const x = fretX(cn.f, p.scale, W);
                 const ny = p.y * H - actualTotalH / 2 + j * actualSpread;
                 // slopsmith#254 — per-string judgment, keyed by the
@@ -1682,12 +1771,20 @@ function createHighway() {
                     drawNote(W, H, x, ny, p.scale, cn.s, cn.f, { ...cn, chord: true }, cnNs);
                 }
 
-                chordPositions.push({ s: cn.s, f: cn.f, bn: cn.bn || 0, x, y: ny, scale: p.scale });
-            });
+                // Nullish-coalesce (??) rather than `||`: undefined / null
+                // from missing bend data still maps to 0 (matches historic
+                // encoding — old code shipped `entry.bn = cn.bn || 0`), but
+                // NaN stays NaN so it fails BOTH the strict-equality branch
+                // below and the `> 0` branch — keeping bad data out of the
+                // unbent connector set rather than silently classifying it
+                // as unbent.
+                const cnBn = cn.bn ?? 0;
+                const entry = { s: cn.s, f: cn.f, bn: cnBn, x, y: ny, scale: p.scale };
+                if (cnBn > 0) bent.push(entry);
+                else if (cnBn === 0) unbent.push(entry);
+            }
 
-            // Unison bend within chord
-            const bent = chordPositions.filter(n => n.bn > 0);
-            const unbent = chordPositions.filter(n => n.bn === 0);
+            // Unison bend within chord — bent / unbent classified inline above.
             if (bent.length > 0 && unbent.length > 0 && sz >= 14) {
                 for (const bn of bent) {
                     let closest = unbent[0];
@@ -1826,7 +1923,7 @@ function createHighway() {
         };
 
         ctx.font = `bold ${fontSize}px sans-serif`;
-        const spaceWidth = ctx.measureText(' ').width;
+        const spaceWidth = _measureLyricText(ctx, fontSize, ' ');
         const maxWidth = W * 0.8;
 
         // Respect authored line breaks; wrap only if a line overflows maxWidth.
@@ -1838,7 +1935,7 @@ function createHighway() {
                 let wordWidth = 0;
                 for (const s of wordSyls) {
                     const text = sylText(s);
-                    const w = ctx.measureText(text).width;
+                    const w = _measureLyricText(ctx, fontSize, text);
                     parts.push({ syl: s, text, width: w });
                     wordWidth += w;
                 }
@@ -1978,6 +2075,7 @@ function createHighway() {
         _frameMismatchWarned.clear();
         _chordRenderCacheSrc = null;
         _chordRenderCacheInverted = null;
+        _chordRenderCacheTemplates = null;
     }
 
     // True if a chord note carries per-strum technique data (bend,
@@ -2014,9 +2112,24 @@ function createHighway() {
     // Two passes over the array: chain bounds, then base-fret resolution
     // (which can read previous chord's cached baseFret).
     function _ensureChordRenderCache(src) {
-        if (_chordRenderCacheSrc === src && _chordRenderCacheInverted === _inverted) return;
+        const templatesChanged = _chordRenderCacheTemplates !== chordTemplates;
+        if (_chordRenderCacheSrc === src && _chordRenderCacheInverted === _inverted && !templatesChanged) return;
         _chordRenderCacheSrc = src;
         _chordRenderCacheInverted = _inverted;
+        _chordRenderCacheTemplates = chordTemplates;
+        // Templates feed isOpen() — when they land after `chords`,
+        // _updateFretLinePreview's stashed open/non-open classification
+        // for the currently-active chord is also stale. It only refreshes
+        // on the next chord transition, so force a refresh here.
+        if (templatesChanged) {
+            _lastChordOnFretLine = null;
+            _chordFretLineNotes = [];
+            // Also clear the once-per-chord-id frame-mismatch warner —
+            // a chord ID warned against stale (missing/empty) templates
+            // would otherwise never be re-validated against the
+            // corrected templates that just landed.
+            _frameMismatchWarned.clear();
+        }
 
         // Pass 1: walk forward, marking chain index / length / isFull on a
         // per-chord WeakMap entry. A chain breaks when the next chord has a
@@ -2039,7 +2152,12 @@ function createHighway() {
                         chainIndex,
                         chainLen: len,
                         isFull: len < CHAIN_RENDER_FULL_MAX || chainIndex === 0 || hasTechniques,
-                        baseFret: 0,  // filled in pass 2
+                        baseFret: 0,        // filled in pass 2
+                        sortedNotes: null,   // ↓ all filled in pass 2 — cached to skip
+                        nonZeroNotes: null,  //   per-frame sort/filter/min/max in drawChords.
+                        nonZeroFrets: null,
+                        allMuted: false,
+                        hasMultipleNotes: false,
                     });
                 }
                 chainStart = i;
@@ -2057,14 +2175,28 @@ function createHighway() {
             const { isOpen } = getChordTemplateInfo(ch.id, chordTemplates);
             const sortedNotes = [...ch.notes].sort((a, b) => _inverted ? b.s - a.s : a.s - b.s);
             const nonZero = sortedNotes.filter(cn => !isOpen(cn));
+            const nonZeroFrets = nonZero.map(cn => cn.f);
             if (nonZero.length >= 1) {
-                info.baseFret = Math.min(...nonZero.map(cn => cn.f));
+                let minF = nonZeroFrets[0];
+                for (let j = 1; j < nonZeroFrets.length; j++) if (nonZeroFrets[j] < minF) minF = nonZeroFrets[j];
+                info.baseFret = minF;
             } else if (i > 0) {
                 const prevInfo = _chordRenderInfo.get(src[i - 1]);
                 info.baseFret = prevInfo ? prevInfo.baseFret : 0;
             } else {
                 info.baseFret = 0;
             }
+            info.sortedNotes = sortedNotes;
+            info.nonZeroNotes = nonZero;
+            info.nonZeroFrets = nonZeroFrets;
+            info.hasMultipleNotes = sortedNotes.length >= 2;
+            let allMuted = sortedNotes.length > 0;
+            if (allMuted) {
+                for (let j = 0; j < sortedNotes.length; j++) {
+                    if (!sortedNotes[j].mt) { allMuted = false; break; }
+                }
+            }
+            info.allMuted = allMuted;
         }
     }
 

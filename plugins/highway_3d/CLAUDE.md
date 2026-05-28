@@ -140,9 +140,10 @@ Every per-frame renderer call receives a `bundle` from slopsmith core. Fields us
 - `renderScale` — pixel-ratio multiplier from the user's quality setting
 - `songInfo.arrangement` — only field of `songInfo` this plugin reads, used as the bass-name fallback in `resolveStringCount()`
 - `stringCount` — slopsmith#93; always prefer this over deriving from tuning/arrangement
+- `lefty` — display flag consumed by this renderer from `bundle.lefty`. Captured into `_leftyCached` before each frame so `xFret()`, `xFretMid()`, `boardSpanX()`, board geometry, note placement, and the camera shoulder offset mirror the fret axis for left-handed mode. A runtime lefty flip rebuilds board state and mirrors `curX`/`tgtX` plus the lookahead camera X cache so the camera does not drift across the neck.
 - `getNoteState(note, chartTime)` — slopsmith#254; per-note judgment from a scorer (note_detect). Captured each frame into `_ndGetNoteState` at the top of `update()` and consulted in `drawNote()` AFTER the event-driven `_ndHitMarks`/`_ndMissMarks` lookup AND over the proximity-based `hit` heuristic, both of which it overrides when it has a verdict: `'hit'`/`'active'` → `mGlow[s]` outline (bright string-tinted, *not* green) + `mGlow[s]` body + `mGlow[s]` sustain trail + a queue entry for `drawNotedetectSizzle` (so a held sustain keeps glowing/sparkling as long as the provider keeps returning `'active'`); `'miss'` → `mMissOutline` and `_showHit = false` (suppresses the bright body even if the note is near the line). Called with the note's chart time (`n.t`), which is how note_detect keys its `noteResults` map — *not* `now`. Returns null on cores without the API or songs with no scorer — then the event path / `hit` heuristic drive feedback for older note_detect builds.
 
-`bundle.lefty` exists at the core level but is delegated to slopsmith's mirror transform — this renderer never reads it. Likewise `tuning` and `capo` aren't consumed by this plugin.
+`tuning` and `capo` aren't consumed by this plugin.
 
 If you need a bundle field that isn't here yet, check `_makeBundle()` in `static/highway.js` in the **slopsmith core repo** — this is the plugin repo, `static/highway.js` is not here. The full path in the parent slopsmith checkout is `slopsmith/static/highway.js`.
 

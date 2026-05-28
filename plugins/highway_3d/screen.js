@@ -10883,6 +10883,7 @@
                     if (leftyChanged) {
                         curX = -curX;
                         tgtX = -tgtX;
+                        _lookaheadCamX = -_lookaheadCamX;
                     }
                     nStr = newNStr;
                     buildBoard();

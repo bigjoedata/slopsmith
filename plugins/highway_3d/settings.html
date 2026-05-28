@@ -350,6 +350,19 @@
                 </div>
             </div>
 
+            <!-- FPS counter -->
+            <div class="mt-4 flex items-start gap-2">
+                <input type="checkbox" id="h3d-fps-visible" class="mt-1 accent-accent"
+                    onchange="window.h3dBgSetFpsVisible && window.h3dBgSetFpsVisible(this.checked)">
+                <label for="h3d-fps-visible" class="text-xs text-gray-300 cursor-pointer">
+                    <span class="font-medium">Show FPS counter.</span>
+                    <span class="block text-[10px] text-gray-500 mt-1">
+                        Displays a live frame-rate readout in the top-right corner of the
+                        highway. Useful for diagnosing performance issues.
+                    </span>
+                </label>
+            </div>
+
             <div class="mt-4">
                 <label for="h3d-vibrancy" class="text-xs font-medium text-gray-400 mb-1 block">
                     Vibrancy: <span id="h3d-vibrancy-label">0.85</span>
@@ -498,11 +511,65 @@
     </details>
 </div>
 
+<div role="group" aria-labelledby="h3d-tone-hud-heading" class="mt-6">
+    <h3 id="h3d-tone-hud-heading" class="text-sm font-medium text-gray-400 mb-2">3D Highway — Tone Changes</h3>
+    <p class="text-xs text-gray-500 mb-3">
+        Overlay card showing the active tone and the next upcoming tone with a
+        countdown. Only appears on songs that carry tone-change data. Displayed
+        in amber to distinguish it from the cyan section card.
+    </p>
+
+    <!-- Show card -->
+    <div class="flex items-center gap-3 mt-3">
+        <label class="flex items-center gap-2 text-sm text-gray-300">
+            <input type="checkbox" id="h3d-tone-hud-visible" checked
+                   onchange="window.h3dBgSetToneHudVisible && window.h3dBgSetToneHudVisible(this.checked)"
+                   class="accent-accent">
+            Show tone change card
+        </label>
+    </div>
+
+    <!-- Position -->
+    <div class="mt-3">
+        <label for="h3d-tone-hud-position" class="text-xs font-medium text-gray-400 mb-1 block">Position</label>
+        <select id="h3d-tone-hud-position"
+            onchange="window.h3dBgSetToneHudPosition && window.h3dBgSetToneHudPosition(this.value)"
+            class="w-full bg-dark-700 border border-gray-800 rounded-lg px-3 py-2 text-xs text-gray-300 outline-none">
+            <option value="tl" selected>Top-left</option>
+            <option value="tr">Top-right</option>
+            <option value="bl">Bottom-left</option>
+            <option value="br">Bottom-right</option>
+        </select>
+    </div>
+
+    <!-- Size slider -->
+    <div class="mt-3">
+        <label for="h3d-tone-hud-size" class="text-xs font-medium text-gray-400 mb-1 block">
+            Size: <span id="h3d-tone-hud-size-label">0.50</span>
+        </label>
+        <input type="range" id="h3d-tone-hud-size" min="0" max="1" step="0.05" value="0.5"
+            oninput="document.getElementById('h3d-tone-hud-size-label').textContent = parseFloat(this.value).toFixed(2); window.h3dBgSetToneHudSize && window.h3dBgSetToneHudSize(this.value)"
+            onchange="window.h3dBgSetToneHudSize && window.h3dBgSetToneHudSize(this.value)"
+            class="w-full accent-accent">
+        <div class="flex justify-between text-[10px] text-gray-500 mt-1"><span>Small</span><span>Large</span></div>
+    </div>
+</div>
+
 <div role="group" aria-labelledby="h3d-chord-diag-heading" class="mt-6">
     <h3 id="h3d-chord-diag-heading" class="text-sm font-medium text-gray-400 mb-2">3D Highway — Chord Diagram</h3>
     <p class="text-xs text-gray-500 mb-3">
         Overlay shown when a named chord is hit. Fades out after impact.
     </p>
+
+    <!-- Visibility toggle -->
+    <div class="flex items-center gap-3 mt-1 mb-4">
+        <label class="flex items-center gap-2 text-sm text-gray-300">
+            <input type="checkbox" id="h3d-chord-diagram-visible" checked
+                   onchange="window.h3dBgSetChordDiagramVisible && window.h3dBgSetChordDiagramVisible(this.checked)"
+                   class="accent-accent">
+            Show chord diagram
+        </label>
+    </div>
 
     <!-- Size slider -->
     <div class="mt-3">
@@ -524,8 +591,6 @@
             class="w-full bg-dark-700 border border-gray-800 rounded-lg px-3 py-2 text-xs text-gray-300 outline-none">
             <option value="tl" selected>Top-left</option>
             <option value="tr">Top-right</option>
-            <option value="bl">Bottom-left</option>
-            <option value="br">Bottom-right</option>
         </select>
     </div>
 
@@ -584,6 +649,19 @@
         </p>
     </div>
 
+    <!-- Fret boundary divider lines -->
+    <div class="mt-4">
+        <label class="flex items-center gap-2 text-xs text-gray-300 cursor-pointer">
+            <input type="checkbox" id="h3d-fret-dividers-visible" checked
+                   onchange="window.h3dBgSetFretDividersVisible && window.h3dBgSetFretDividersVisible(this.checked)"
+                   class="accent-accent">
+            Show fret boundary divider lines
+        </label>
+        <p class="text-[10px] text-gray-500 mt-1 ml-6">
+            Thin vertical lines at every fret across the full highway width.
+        </p>
+    </div>
+
     <!-- Hydrate from localStorage on load. Mirror runtime defaults AND
          coercion rules from screen.js's BG_DEFAULTS / _bgCoerce so first-
          run users see what the renderer actually drew, and any garbage
@@ -592,15 +670,14 @@
          no-selection / NaN state. -->
     <script>
         (function () {
-            const DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: true, fretNumberGhostScope: 'rocksmith', cameraSmoothing: 0.5, zoomSmoothing: 0.5, tiltSmoothing: 0.5, cameraLockLow: false, cameraLockZoom: 0.5, cameraMode: 'lookahead', nutHeadstockVisible: true, tuningLabelsVisible: true, nutColor: '#f5f3f0', headstockColor: '#d4b48a', textSize: 0.5, vibrancy: 0.85, glow: 0.25, customImageDataUrl: '', customImageName: '', customVideoName: '', chordDiagramSize: 0.5, chordDiagramPosition: 'tl', fretColumnMarkerCadence: 1, projectionVisible: true, inlayLabelsVisible: false, sectionLabelsOnHighway: false, sectionHudVisible: true, sectionHudPosition: 'tr', sectionHudSize: 0.5 };
+            const DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: true, fretNumberGhostScope: 'rocksmith', cameraSmoothing: 0.5, zoomSmoothing: 0.5, tiltSmoothing: 0.5, cameraLockLow: false, cameraLockZoom: 0.5, cameraMode: 'lookahead', nutHeadstockVisible: true, tuningLabelsVisible: true, nutColor: '#f5f3f0', headstockColor: '#d4b48a', textSize: 0.5, vibrancy: 0.85, glow: 0.25, customImageDataUrl: '', customImageName: '', customVideoName: '', chordDiagramVisible: true, chordDiagramSize: 0.5, chordDiagramPosition: 'tl', fretColumnMarkerCadence: 1, projectionVisible: true, inlayLabelsVisible: false, sectionLabelsOnHighway: false, sectionHudVisible: true, sectionHudPosition: 'tr', sectionHudSize: 0.5, toneHudVisible: true, toneHudPosition: 'tl', toneHudSize: 0.5, fpsVisible: false, fretDividersVisible: true };
             const VALID_STYLES = new Set(['off', 'particles', 'silhouettes', 'lights', 'geometric', 'image', 'video']);
             const VALID_PALETTES = new Set(['default', 'neon', 'pastel', 'colorblind_hc']);
             const VALID_CAMERA_MODES = new Set(['steady', 'lookahead']);
-            const VALID_CHORD_DIAG_POSITIONS = new Set(['tl', 'tr', 'bl', 'br']);
-            // Section HUD shares the same four-corner anchor set as the
-            // chord diagram (the renderer enforces the same id list via
-            // CHORD_DIAG_POSITION_IDS), so reuse the validator here.
-            const VALID_SECTION_HUD_POSITIONS = VALID_CHORD_DIAG_POSITIONS;
+            // Chord diagram is top-only (bl/br removed).
+            const VALID_CHORD_DIAG_POSITIONS = new Set(['tl', 'tr']);
+            // Section HUD still supports all four corners independently.
+            const VALID_SECTION_HUD_POSITIONS = new Set(['tl', 'tr', 'bl', 'br']);
             const VALID_FRET_GHOST_SCOPES = new Set(['rocksmith', 'all']);
             // Custom images are persisted as base64 data URLs in
             // localStorage. base64 expands the byte count by ~4/3, and
@@ -707,6 +784,7 @@
             let storedTextSize = null;
             let storedVibrancy = null;
             let storedGlow = null;
+            let storedChordDiagramVisible = null;
             let storedChordDiagramSize = null;
             let storedChordDiagramPosition = null;
             let storedFretColumnMarkerCadence = null;
@@ -715,11 +793,16 @@
             let storedSectionHudVisible = null;
             let storedSectionHudPosition = null;
             let storedSectionHudSize = null;
+            let storedToneHudVisible = null;
+            let storedToneHudPosition = null;
+            let storedToneHudSize = null;
             let storedNutHeadstockVisible = null;
             let storedTuningLabelsVisible = null;
             let storedNutColor = null;
             let storedHeadstockColor = null;
+            let storedFpsVisible = null;
             let storedProjectionVisible = null;
+            let storedFretDividersVisible = null;
             try {
                 storedStyle = localStorage.getItem('h3d_bg_style');
                 storedI = localStorage.getItem('h3d_bg_intensity');
@@ -736,6 +819,7 @@
                 storedTextSize = localStorage.getItem('h3d_bg_textSize');
                 storedVibrancy = localStorage.getItem('h3d_bg_vibrancy');
                 storedGlow = localStorage.getItem('h3d_bg_glow');
+                storedChordDiagramVisible = localStorage.getItem('h3d_bg_chordDiagramVisible');
                 storedChordDiagramSize = localStorage.getItem('h3d_bg_chordDiagramSize');
                 storedChordDiagramPosition = localStorage.getItem('h3d_bg_chordDiagramPosition');
                 storedFretColumnMarkerCadence = localStorage.getItem('h3d_bg_fretColumnMarkerCadence');
@@ -744,11 +828,16 @@
                 storedSectionHudVisible = localStorage.getItem('h3d_bg_sectionHudVisible');
                 storedSectionHudPosition = localStorage.getItem('h3d_bg_sectionHudPosition');
                 storedSectionHudSize = localStorage.getItem('h3d_bg_sectionHudSize');
+                storedToneHudVisible = localStorage.getItem('h3d_bg_toneHudVisible');
+                storedToneHudPosition = localStorage.getItem('h3d_bg_toneHudPosition');
+                storedToneHudSize = localStorage.getItem('h3d_bg_toneHudSize');
                 storedNutHeadstockVisible = localStorage.getItem('h3d_bg_nutHeadstockVisible');
                 storedTuningLabelsVisible = localStorage.getItem('h3d_bg_tuningLabelsVisible');
                 storedNutColor = localStorage.getItem('h3d_bg_nutColor');
                 storedHeadstockColor = localStorage.getItem('h3d_bg_headstockColor');
+                storedFpsVisible = localStorage.getItem('h3d_bg_fpsVisible');
                 storedProjectionVisible = localStorage.getItem('h3d_bg_projectionVisible');
+                storedFretDividersVisible = localStorage.getItem('h3d_bg_fretDividersVisible');
                 storedCustomImageDataUrl = localStorage.getItem('h3d_bg_customImageDataUrl');
                 storedCustomImageName = localStorage.getItem('h3d_bg_customImageName');
                 storedCustomVideoName = localStorage.getItem('h3d_bg_customVideoName');
@@ -785,6 +874,7 @@
             const glow = (storedGlow == null)
                 ? DEFAULTS.glow
                 : coerceUnitInterval(storedGlow, DEFAULTS.glow);
+            const chordDiagramVisible = coerceBool(storedChordDiagramVisible, DEFAULTS.chordDiagramVisible);
             const chordDiagramSize = (storedChordDiagramSize == null)
                 ? DEFAULTS.chordDiagramSize
                 : coerceUnitInterval(storedChordDiagramSize, DEFAULTS.chordDiagramSize);
@@ -803,11 +893,20 @@
             const sectionHudSize = (storedSectionHudSize == null)
                 ? DEFAULTS.sectionHudSize
                 : coerceUnitInterval(storedSectionHudSize, DEFAULTS.sectionHudSize);
+            const toneHudVisible = coerceBool(storedToneHudVisible, DEFAULTS.toneHudVisible);
+            const toneHudPosition = (storedToneHudPosition !== null && VALID_SECTION_HUD_POSITIONS.has(storedToneHudPosition))
+                ? storedToneHudPosition
+                : DEFAULTS.toneHudPosition;
+            const toneHudSize = (storedToneHudSize == null)
+                ? DEFAULTS.toneHudSize
+                : coerceUnitInterval(storedToneHudSize, DEFAULTS.toneHudSize);
             const nutHeadstockVisible = coerceBool(storedNutHeadstockVisible, DEFAULTS.nutHeadstockVisible);
             const tuningLabelsVisible = coerceBool(storedTuningLabelsVisible, DEFAULTS.tuningLabelsVisible);
             const nutColor = coerceHex6(storedNutColor, DEFAULTS.nutColor);
             const headstockColor = coerceHex6(storedHeadstockColor, DEFAULTS.headstockColor);
+            const fpsVisible = coerceBool(storedFpsVisible, DEFAULTS.fpsVisible);
             const projectionVisible = coerceBool(storedProjectionVisible, DEFAULTS.projectionVisible);
+            const fretDividersVisible = coerceBool(storedFretDividersVisible, DEFAULTS.fretDividersVisible);
             const customImageDataUrl = (typeof storedCustomImageDataUrl === 'string') ? storedCustomImageDataUrl : DEFAULTS.customImageDataUrl;
             const customImageName    = (typeof storedCustomImageName === 'string')    ? storedCustomImageName    : DEFAULTS.customImageName;
             const customVideoName    = (typeof storedCustomVideoName === 'string')    ? storedCustomVideoName    : DEFAULTS.customVideoName;
@@ -834,6 +933,7 @@
             const vlbl = document.getElementById('h3d-vibrancy-label');
             const gsli  = document.getElementById('h3d-glow');
             const glbl  = document.getElementById('h3d-glow-label');
+            const cdvis = document.getElementById('h3d-chord-diagram-visible');
             const cdsli = document.getElementById('h3d-chord-diagram-size');
             const cdslbl= document.getElementById('h3d-chord-diagram-size-label');
             const cdpos = document.getElementById('h3d-chord-diagram-position');
@@ -844,10 +944,15 @@
             const shpos = document.getElementById('h3d-section-hud-position');
             const shsi  = document.getElementById('h3d-section-hud-size');
             const shslbl= document.getElementById('h3d-section-hud-size-label');
+            const thvi  = document.getElementById('h3d-tone-hud-visible');
+            const thpos = document.getElementById('h3d-tone-hud-position');
+            const thsi  = document.getElementById('h3d-tone-hud-size');
+            const thslbl= document.getElementById('h3d-tone-hud-size-label');
             const nhv   = document.getElementById('h3d-nut-headstock-visible');
             const tlv   = document.getElementById('h3d-tuning-labels-visible');
             const nco   = document.getElementById('h3d-nut-color');
             const hco   = document.getElementById('h3d-headstock-color');
+            const fpv   = document.getElementById('h3d-fps-visible');
             const pgh   = document.getElementById('h3d-projection-visible');
             const fileInput = document.getElementById('h3d-bg-custom-image-file');
             const clearBtn  = document.getElementById('h3d-bg-custom-image-clear');
@@ -906,17 +1011,25 @@
             if (vlbl) vlbl.textContent = vibrancy.toFixed(2);
             if (gsli)  gsli.value  = String(glow);
             if (glbl)  glbl.textContent = glow.toFixed(2);
+            if (cdvis) cdvis.checked = chordDiagramVisible;
             if (cdsli) cdsli.value  = String(chordDiagramSize);
             if (cdslbl) cdslbl.textContent = chordDiagramSize.toFixed(2);
             if (cdpos) cdpos.value  = chordDiagramPosition;
             if (fcmc)  fcmc.value   = String(fretColumnMarkerCadence);
             if (ilv)   ilv.checked  = !inlayLabelsVisible;
+            if (fpv)   fpv.checked  = fpsVisible;
             if (pgh)   pgh.checked  = projectionVisible;
+            const fdv = document.getElementById('h3d-fret-dividers-visible');
+            if (fdv)   fdv.checked  = fretDividersVisible;
             if (slhi)  slhi.checked = sectionLabelsOnHighway;
             if (shvi)  shvi.checked = sectionHudVisible;
             if (shpos) shpos.value  = sectionHudPosition;
             if (shsi)  shsi.value   = String(sectionHudSize);
             if (shslbl) shslbl.textContent = sectionHudSize.toFixed(2);
+            if (thvi)  thvi.checked = toneHudVisible;
+            if (thpos) thpos.value  = toneHudPosition;
+            if (thsi)  thsi.value   = String(toneHudSize);
+            if (thslbl) thslbl.textContent = toneHudSize.toFixed(2);
 
             // Palette preview swatches. Mirror of PALETTES in screen.js —
             // KEEP IN SYNC. Settings panel paints these from the dropdown

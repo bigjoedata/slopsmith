@@ -563,3 +563,62 @@ def test_arrangement_properties_represent_zero_is_default(tmp_path):
     arr = parse_arrangement(_write_xml(tmp_path, xml))
     assert arr.represent == 0
     assert arr.path_lead is True
+
+
+def test_chord_level_fret_hand_mute_maps_to_fret_hand_mute(tmp_path):
+    """Chord-wide fretHandMute on a template-expanded chord sets
+    fret_hand_mute (wire "fhm") on each synthetic note, not mute ("mt") —
+    matching _parse_note and preserving wire-format fidelity."""
+    xml = (
+        "<song>"
+        + '<tuning string0="0" string1="0" string2="0" string3="0" string4="0" string5="0"/>'
+        + '<chordTemplates count="1">'
+        + '<chordTemplate chordName="P5" displayName="P5" fret0="3" fret1="5"/>'
+        + "</chordTemplates>"
+        + '<levels count="1">'
+        + '<level difficulty="0">'
+        + '<notes count="0"/>'
+        + '<chords count="1">'
+        + '<chord time="1.0" chordId="0" fretHandMute="1"/>'
+        + "</chords>"
+        + '<anchors count="0"/>'
+        + '<handShapes count="0"/>'
+        + "</level>"
+        + "</levels>"
+        + "</song>"
+    )
+    arr = parse_arrangement(_write_xml(tmp_path, xml))
+    assert len(arr.chords) == 1
+    notes = arr.chords[0].notes
+    assert notes  # template expanded into synthetic notes
+    assert all(n.fret_hand_mute is True for n in notes)
+    assert all(n.mute is False for n in notes)
+
+
+def test_chord_level_fret_hand_mute_propagates_to_chord_notes(tmp_path):
+    """A <chord fretHandMute="1"> with explicit <chordNote> children sets
+    fret_hand_mute on children that don't override it, without touching mute."""
+    xml = (
+        "<song>"
+        + _TUNING_AND_TEMPLATES
+        + '<levels count="1">'
+        + '<level difficulty="0">'
+        + '<notes count="0"/>'
+        + '<chords count="1">'
+        + '<chord time="1.0" chordId="0" fretHandMute="1">'
+        + '<chordNote time="1.0" string="0" fret="3"/>'
+        + '<chordNote time="1.0" string="1" fret="5" fretHandMute="0"/>'
+        + "</chord>"
+        + "</chords>"
+        + '<anchors count="0"/>'
+        + '<handShapes count="0"/>'
+        + "</level>"
+        + "</levels>"
+        + "</song>"
+    )
+    arr = parse_arrangement(_write_xml(tmp_path, xml))
+    notes = arr.chords[0].notes
+    assert len(notes) == 2
+    assert notes[0].fret_hand_mute is True   # inherits chord-level flag
+    assert notes[1].fret_hand_mute is False  # explicit override preserved
+    assert all(n.mute is False for n in notes)

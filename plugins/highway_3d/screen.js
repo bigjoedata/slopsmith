@@ -70,6 +70,10 @@
 
     const SCALE = 2.25;
     const K = SCALE / 300;
+    // Horizontal stretch factor for fret X positions.  Increasing this widens
+    // the lane (frets, board plane, strings, notes, lane strip) without
+    // affecting K-based vertical dimensions (string gap, note height, camera).
+    const FRET_SCALE = SCALE * 1.1;
 
     const NFRETS = 24;
     const NSTR = 6;
@@ -507,7 +511,10 @@
     const DIAG_SIZE_MIN    = 0.08;
     const DIAG_SIZE_MAX    = 0.16;
     const DIAG_CELL_MAX    = 34;
-    const CHORD_DIAG_POSITION_IDS = ['tl', 'tr', 'bl', 'br'];
+    // 'bl' and 'br' removed — diagram is top-only. Legacy localStorage values
+    // that contain 'bl'/'br' will fall back to BG_DEFAULTS.chordDiagramPosition
+    // via _bgCoerce (which rejects values not in this list).
+    const CHORD_DIAG_POSITION_IDS = ['tl', 'tr'];
 
     /** Default chord-box rim / fill gradient (teal family). */
     const CHORD_BOX_TEAL_HEX = 0x00d2d5;
@@ -588,9 +595,9 @@
     // Logarithmic spacing — mirrors real guitar fret geometry (12th root of 2).
     const _fretXLog = f => {
         if (f <= 0) return 0;
-        const raw = SCALE - SCALE / Math.pow(2, f / 12);
+        const raw = FRET_SCALE - FRET_SCALE / Math.pow(2, f / 12);
         if (f <= FRET_SPACING_ANCHOR_F) return raw;
-        const rawAnchor = SCALE - SCALE / Math.pow(2, FRET_SPACING_ANCHOR_F / 12);
+        const rawAnchor = FRET_SCALE - FRET_SCALE / Math.pow(2, FRET_SPACING_ANCHOR_F / 12);
         return rawAnchor + (raw - rawAnchor) * FRET_SPACING_STRETCH_ABOVE12;
     };
     // Uniform spacing — same column width per fret (Rocksmith Remastered style).
@@ -934,7 +941,7 @@
         return _bgBandsCache;
     }
 
-    const BG_DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: true, fretNumberGhostScope: 'rocksmith', cameraSmoothing: 0.5, zoomSmoothing: 0.5, tiltSmoothing: 0.5, cameraLockLow: false, cameraLockZoom: 0.5, cameraMode: 'lookahead', nutHeadstockVisible: true, tuningLabelsVisible: true, nutColor: '#f5f3f0', headstockColor: '#d4b48a', textSize: 0.5, vibrancy: 0.85, glow: 0.25, customImageDataUrl: '', customImageName: '', customVideoName: '', chordDiagramSize: 0.5, chordDiagramPosition: 'tl', fretColumnMarkerCadence: 1, projectionVisible: true, inlayLabelsVisible: false, sectionLabelsOnHighway: false, sectionHudVisible: true, sectionHudPosition: 'tr', sectionHudSize: 0.5 };
+    const BG_DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: true, fretNumberGhostScope: 'rocksmith', cameraSmoothing: 0.5, zoomSmoothing: 0.5, tiltSmoothing: 0.5, cameraLockLow: false, cameraLockZoom: 0.5, cameraMode: 'lookahead', nutHeadstockVisible: true, tuningLabelsVisible: true, nutColor: '#f5f3f0', headstockColor: '#d4b48a', textSize: 0.5, vibrancy: 0.85, glow: 0.25, customImageDataUrl: '', customImageName: '', customVideoName: '', chordDiagramVisible: true, chordDiagramSize: 0.5, chordDiagramPosition: 'tl', fretColumnMarkerCadence: 1, projectionVisible: true, inlayLabelsVisible: false, sectionLabelsOnHighway: false, sectionHudVisible: true, sectionHudPosition: 'tr', sectionHudSize: 0.5, toneHudVisible: true, toneHudPosition: 'tl', toneHudSize: 0.5, fpsVisible: false, fretDividersVisible: true };
     const BG_STYLE_IDS = ['off', 'particles', 'silhouettes', 'lights', 'geometric', 'image', 'video'];
     const FRET_NUMBER_GHOST_SCOPE_IDS = ['rocksmith', 'all'];
 
@@ -973,7 +980,7 @@
     // means (fall back to default rather than silently flipping to
     // false). Add new boolean keys to BG_DEFAULTS and they pick this
     // up via the dispatch below.
-    const _BG_BOOL_KEYS = new Set(['reactive', 'showFretOnNote', 'cameraLockLow', 'inlayLabelsVisible', 'sectionLabelsOnHighway', 'sectionHudVisible', 'nutHeadstockVisible', 'tuningLabelsVisible', 'projectionVisible']);
+    const _BG_BOOL_KEYS = new Set(['reactive', 'showFretOnNote', 'cameraLockLow', 'inlayLabelsVisible', 'sectionLabelsOnHighway', 'sectionHudVisible', 'nutHeadstockVisible', 'tuningLabelsVisible', 'projectionVisible', 'chordDiagramVisible', 'fpsVisible', 'toneHudVisible', 'fretDividersVisible']);
     function _bgCoerceBool(val, fallback) {
         if (val === 'true' || val === '1') return true;
         if (val === 'false' || val === '0') return false;
@@ -983,7 +990,7 @@
     // hysteresis; zoomSmoothing the zoom dead zone; tiltSmoothing the
     // vertical-tilt deadband + correction strength. All three slider-
     // shaped settings share the same parse + clamp behaviour.
-    const _BG_FLOAT_KEYS = new Set(['intensity', 'cameraSmoothing', 'zoomSmoothing', 'tiltSmoothing', 'cameraLockZoom', 'textSize', 'vibrancy', 'glow', 'chordDiagramSize', 'sectionHudSize']);
+    const _BG_FLOAT_KEYS = new Set(['intensity', 'cameraSmoothing', 'zoomSmoothing', 'tiltSmoothing', 'cameraLockZoom', 'textSize', 'vibrancy', 'glow', 'chordDiagramSize', 'sectionHudSize', 'toneHudSize']);
     function _bgCoerce(key, val) {
         if (_BG_FLOAT_KEYS.has(key)) {
             const n = parseFloat(val);
@@ -995,7 +1002,9 @@
         if (key === 'chordDiagramPosition')
             return CHORD_DIAG_POSITION_IDS.includes(val) ? val : BG_DEFAULTS.chordDiagramPosition;
         if (key === 'sectionHudPosition')
-            return CHORD_DIAG_POSITION_IDS.includes(val) ? val : BG_DEFAULTS.sectionHudPosition;
+            return ['tl', 'tr', 'bl', 'br'].includes(val) ? val : BG_DEFAULTS.sectionHudPosition;
+        if (key === 'toneHudPosition')
+            return ['tl', 'tr', 'bl', 'br'].includes(val) ? val : BG_DEFAULTS.toneHudPosition;
         if (key === 'cameraMode') {
             if (val === 'classic') val = 'steady';
             return CAMERA_MODE_IDS.includes(val) ? val : BG_DEFAULTS.cameraMode;
@@ -1083,6 +1092,12 @@
     window.h3dBgSetTextSize = (v) => _bgWriteGlobal('textSize', v);
     window.h3dBgSetVibrancy = (v) => _bgWriteGlobal('vibrancy', v);
     window.h3dBgSetGlow     = (v) => _bgWriteGlobal('glow', v);
+    window.h3dBgSetToneHudVisible   = (v) => _bgWriteGlobal('toneHudVisible', !!v);
+    window.h3dBgSetToneHudPosition  = (v) => _bgWriteGlobal('toneHudPosition', v);
+    window.h3dBgSetToneHudSize      = (v) => _bgWriteGlobal('toneHudSize', v);
+    window.h3dBgSetFpsVisible           = (v) => _bgWriteGlobal('fpsVisible', !!v);
+    window.h3dBgSetFretDividersVisible  = (v) => _bgWriteGlobal('fretDividersVisible', !!v);
+    window.h3dBgSetChordDiagramVisible  = (v) => _bgWriteGlobal('chordDiagramVisible', !!v);
     window.h3dBgSetChordDiagramSize     = (v) => _bgWriteGlobal('chordDiagramSize', v);
     window.h3dBgSetChordDiagramPosition = (v) => _bgWriteGlobal('chordDiagramPosition', v);
     window.h3dBgSetFretColumnMarkerCadence = (v) => _bgWriteGlobal('fretColumnMarkerCadence', v);
@@ -1875,6 +1890,12 @@
         let fretG = null, tuningLblG = null, noteG = null, beatG = null, lblG = null;
         let gNote = null, gSus = null, gBeat = null, gTapChevron = null;
         let mStr = [], mGlow = [], mSus = [], mStrHitOutline = [], mAccentOutline = [], mAccentCore = [], mAccentHaloNear = [], mAccentHaloMid = [], mAccentHaloFar = [];
+        // Pre-built accent-halo shell descriptors per string. Populated after
+        // mAccentHaloFar/Mid/Near are materialised; consumed in drawNote()'s
+        // hot path so the inner per-note `accentShells = [...]` array literal
+        // (3 plain-object allocations per accent gem per frame) is replaced
+        // by a stable read. Index 0 = outer, 1 = mid, 2 = near.
+        let _accentShellsByString = [];
         let mWhiteOutline = null, mSusOutline = null;
         // Dedicated sustain-trail outline material for the hit verdict.
         // Drawn at opacity 0.45 — lower than mSusOutline (0.75) so the
@@ -1922,6 +1943,14 @@
         let _laneTargetColor = null;
         let _renderScale = 1;
         let lyricsCanvas = null, lyricsCtx = null;
+        // FPS counter overlay. EMA-smoothed over ~30 frames so the readout doesn't
+        // jitter every rAF tick. Controlled by the 'fpsVisible' setting (BG_DEFAULTS).
+        // Legacy 'h3d_showFps' localStorage key and window.h3dShowFps are no longer
+        // consulted — use the Settings → 3D Highway — Camera → Show FPS counter checkbox.
+        let _fpsLastT = 0;
+        let _fpsEma = 0;
+        let _fpsDisplay = 0;
+        let _fpsLastSampleT = 0;
         let _diagChord            = null;
         // Chord diagram render cache. Keys: static layout inputs joined as a
         // string. Values: OffscreenCanvas (or <canvas>) rendered at opacity=1
@@ -2076,6 +2105,9 @@
         // linear blend every frame.
         let vibrancy            = BG_DEFAULTS.vibrancy;
         let glowMul             = BG_DEFAULTS.glow;
+        let fpsVisible           = BG_DEFAULTS.fpsVisible;
+        let fretDividersVisible  = BG_DEFAULTS.fretDividersVisible;
+        let chordDiagramVisible  = BG_DEFAULTS.chordDiagramVisible;
         let chordDiagramSize     = BG_DEFAULTS.chordDiagramSize;
         let chordDiagramPosition = BG_DEFAULTS.chordDiagramPosition;
         let fretColumnMarkerCadence = BG_DEFAULTS.fretColumnMarkerCadence;
@@ -2084,6 +2116,9 @@
         let sectionHudVisible      = BG_DEFAULTS.sectionHudVisible;
         let sectionHudPosition     = BG_DEFAULTS.sectionHudPosition;
         let sectionHudSize         = BG_DEFAULTS.sectionHudSize;
+        let toneHudVisible         = BG_DEFAULTS.toneHudVisible;
+        let toneHudPosition        = BG_DEFAULTS.toneHudPosition;
+        let toneHudSize            = BG_DEFAULTS.toneHudSize;
         let nutHeadstockVisible    = BG_DEFAULTS.nutHeadstockVisible;
         let tuningLabelsVisible    = BG_DEFAULTS.tuningLabelsVisible;
         let nutColor               = BG_DEFAULTS.nutColor;
@@ -2142,6 +2177,24 @@
         // entries the forward-only prune can't reach, so we wipe the
         // map instead of paying an O(n) scan per frame to find them.
         let _chordVerdictsLastNow = null;
+        // Numeric encoding for the _chordVerdicts key — replaces
+        // ``${ch.id}|${ch.t}`` which allocated a string per chord per
+        // frame in detect mode. Encoded so the key is monotonic in
+        // chord time and the prune sweep can compare keys directly
+        // (no parseFloat / String.slice). The time component sits in
+        // the upper bits; chord-template ids share the lower 1e6 slot
+        // and ch.id == null reserves idSlot 0 (no real chord id can
+        // collide with it because real ids encode as id + 1).
+        // ``time * 1e4`` keeps a 0.1 ms resolution — more than enough
+        // to disambiguate distinct chord onsets — and stays under the
+        // safe-integer limit for any realistic song length.
+        const _CV_KEY_TIME_MUL = 1e4;
+        const _CV_KEY_TIME_SLOT = 1e6;
+        function _encodeChordVerdictKey(ch) {
+            const tSlot = Math.round(ch.t * _CV_KEY_TIME_MUL) * _CV_KEY_TIME_SLOT;
+            const idSlot = ch.id != null ? ((Number(ch.id) | 0) + 1) : 0;
+            return tSlot + idSlot;
+        }
         // Per-frame timestamp captured by update() and used by its
         // prune pass for the notedetect mark arrays. drawNote itself
         // no longer reads it — pruning lives once per frame so
@@ -2174,7 +2227,7 @@
         // Hoisted so draw() can reference them when assigning per-stripe.
         let mLaneOdd = null, mLaneEven = null, gLanePlane = null;
         /** Lane fret dividers: default white vs arpeggio frame tint on outer wires only. */
-        let mLaneDivider = null, mLaneDividerArp = null;
+        let mLaneDivider = null, mLaneDividerArp = null, mLaneDividerExt = null;
         /** Shared XY plane for ghost fret digits (lies on board like proj, not billboarding). */
         let gGhostFretPlane = null, pGhostFretLbl = null;
         // Anchor-driven lane scratch buffers. Per-frame the loop builds up
@@ -2277,13 +2330,27 @@
         // the vast majority of charts have no out-of-range strings. Scan
         // first; only allocate when there's actually something to drop.
         // The unfiltered array is reused as-is in the common case.
+        //
+        // Result is cached by ``ch.notes`` identity — call sites (chord
+        // render loop, camera pre-pass, strGlow / accent prepasses, cjNext
+        // peek) hit the same chord-notes array many times per frame, and
+        // the array contents are chart-static for the lifetime of the
+        // arrangement. The cache stores either the input array itself
+        // (common case) or the filtered copy, so the identity-preservation
+        // contract callers depend on is unchanged.
+        const _filterValidNotesCache = new WeakMap();
         function filterValidNotes(notes) {
+            const cached = _filterValidNotesCache.get(notes);
+            if (cached !== undefined) return cached;
+            let filtered = notes;
             for (let i = 0; i < notes.length; i++) {
                 if (!validString(notes[i].s)) {
-                    return notes.filter(cn => validString(cn.s));
+                    filtered = notes.filter(cn => validString(cn.s));
+                    break;
                 }
             }
-            return notes;
+            _filterValidNotesCache.set(notes, filtered);
+            return filtered;
         }
 
         /**
@@ -2352,6 +2419,29 @@
         // [...chShape].filter().map().sort() chain (3 allocations per chord per frame).
         const _scrAtMinFretArr = new Array(MAX_RENDER_STRINGS).fill(0);
         let _scrAtMinFretLen = 0;
+        // Sorted scalar view of "next event time per string ∪ recent event
+        // time per string" — populated once per frame in update() after
+        // _drawNextByString and _drawRecentByString are set. drawNote() and
+        // the chord render loop both need "earliest event time strictly
+        // greater than t" to deadline-cap gem visibility; the previous
+        // implementation re-scanned both per-string arrays (2 * nStr
+        // lookups) per note/chord per frame, which is hot in dense
+        // PM/FH/arpeggio passages. With this scratch the same query is
+        // O(log N) over at most 2 * MAX_RENDER_STRINGS = 16 entries via
+        // _firstEventTimeGreaterThan(). Capacity is fixed (Float64Array)
+        // to keep the buffer in stable memory; _scrEventTimesLen tracks
+        // the live prefix.
+        const _scrEventTimes    = new Float64Array(MAX_RENDER_STRINGS * 2);
+        let   _scrEventTimesLen = 0;
+        function _firstEventTimeGreaterThan(t) {
+            let lo = 0, hi = _scrEventTimesLen;
+            while (lo < hi) {
+                const mid = (lo + hi) >>> 1;
+                if (_scrEventTimes[mid] <= t) lo = mid + 1;
+                else hi = mid;
+            }
+            return lo < _scrEventTimesLen ? _scrEventTimes[lo] : Infinity;
+        }
 
         // Camera state
         let _leftyCached = false;
@@ -2783,6 +2873,22 @@
             return mat;
         }
 
+        // Only two PM/FH variants exist (palm-mute = black-on-white,
+        // fret-hand mute = white-on-black). drawNote() hits muteXMat per
+        // muted chord-note per frame, so dense PM/FH passages were paying
+        // for a string concat + Map lookup on every call. Hoist both
+        // SpriteMaterial refs and short-circuit before touching the cache.
+        // They're populated lazily on first use; teardown still reaches
+        // them via the shared ``txtCache`` because muteXMat writes there.
+        let _pmXSpriteMat = null;
+        let _fhXSpriteMat = null;
+        function palmMuteXSpriteMat() {
+            return _pmXSpriteMat ?? (_pmXSpriteMat = muteXMat('#000000', '#ffffff'));
+        }
+        function fretHandMuteXSpriteMat() {
+            return _fhXSpriteMat ?? (_fhXSpriteMat = muteXMat('#ffffff', '#000000'));
+        }
+
         function muteXMat(fillCol, strokeCol) {
             const k = 'technique|muteX|v2|' + String(fillCol) + '|' + String(strokeCol);
             if (txtCache[k]) return txtCache[k];
@@ -2914,22 +3020,23 @@
          * Convert any SpriteMaterial to a MeshBasicMaterial that shares its canvas
          * texture, so technique markers can be applied to a rotatable PlaneGeometry
          * mesh instead of a billboard Sprite. Cached on userData to avoid allocations.
+         *
+         * The cache is multi-entry: each pTechPlane mesh holds a Map<sm.map,
+         * clone> so a recycled mesh that's used for several techniques
+         * (hammer-on, palm-mute, harmonic, bend...) across frames keeps a
+         * clone for each one rather than disposing-and-recloning on every
+         * switch. With nStr-wide chords containing mixed PM/FH/HO/HP
+         * markers this collapses the per-frame allocation entirely while
+         * still being bounded — the per-mesh Map has at most one entry per
+         * distinct technique × colour the mesh has ever been used for.
          */
         function _spriteMat2MeshMat(mesh, sm) {
-            // Cache the cloned MeshBasicMaterial on the receiving mesh so the
-            // same mesh–sprite pairing reuses one material object across frames
-            // instead of allocating a new clone every frame (unbounded growth).
-            // The clone is invalidated only when the source sprite's map changes
-            // (different technique or colour). Opacity is always set by the
-            // caller immediately after, so stale-value risk is zero.
-            const cached = mesh.userData.h3dTechMeshMatClone;
-            if (cached && cached.map === sm.map) return cached;
-            // Source texture changed or first call for this mesh — dispose old.
-            if (cached) {
-                _techMeshMatClones.delete(cached);
-                cached.dispose();
-                mesh.userData.h3dTechMeshMatClone = null;
+            let perMesh = mesh.userData.h3dTechMeshMatCloneByMap;
+            if (perMesh) {
+                const hit = perMesh.get(sm.map);
+                if (hit) return hit;
             }
+
             let base = sm.userData.h3dTechMeshMat;
             if (!base) {
                 base = new T.MeshBasicMaterial({
@@ -2955,11 +3062,15 @@
             // teardown's scene.traverse() pass can no longer reach it, so it
             // would leak one GPU material per pooled mesh for the renderer's
             // lifetime.
-            if (!cached && mesh.material && mesh.material !== base) {
+            if (!perMesh && mesh.material && mesh.material !== base) {
                 mesh.material.dispose?.();
             }
+            if (!perMesh) {
+                perMesh = new Map();
+                mesh.userData.h3dTechMeshMatCloneByMap = perMesh;
+            }
             const clone = base.clone();
-            mesh.userData.h3dTechMeshMatClone = clone;
+            perMesh.set(sm.map, clone);
             _techMeshMatClones.add(clone);
             return clone;
         }
@@ -3216,6 +3327,7 @@
                 position = 'tl',
                 nStr = 6,
                 lyricsBottom = 0,
+                stackOffset = 0,
             } = opts;
 
             // Responsive sizing — CELL derived from panel height + user slider.
@@ -3301,10 +3413,10 @@
             const E    = PAD;
             const TOP_Y = Math.round(Math.max(E + canvasH * 0.06, lyricsBottom + E));
             let bx, by;
-            if      (position === 'tr') { bx = canvasW - boxW - E; by = TOP_Y; }
-            else if (position === 'bl') { bx = E; by = canvasH - boxH - E; }
-            else if (position === 'br') { bx = canvasW - boxW - E; by = canvasH - boxH - E; }
-            else                        { bx = E; by = TOP_Y; }
+            if      (position === 'tr') { bx = canvasW - boxW - E; by = TOP_Y + stackOffset; }
+            else if (position === 'bl') { bx = E; by = canvasH - boxH - E - stackOffset; }
+            else if (position === 'br') { bx = canvasW - boxW - E; by = canvasH - boxH - E - stackOffset; }
+            else                        { bx = E; by = TOP_Y + stackOffset; }
 
             // Clamp so the box never bleeds off-canvas on narrow panels or wide string counts.
             bx = Math.max(0, Math.min(canvasW - boxW, bx));
@@ -3529,6 +3641,7 @@
                 }
             }
             ctx.restore();
+            return boxH;
         }
 
         // Cached wrapper for drawChordDiagram. When entranceT === 1 (scale
@@ -3537,31 +3650,37 @@
         // globalAlpha. During the 0.2 s entrance animation (entranceT < 1)
         // the scale transform is non-trivial so we fall through to a fresh
         // render — that window is ~12 frames at 60 fps, negligible.
+        //
+        // Returns boxH (diagram card height in px) so the draw loop can
+        // accumulate per-corner stack offsets when multiple overlays share
+        // the same corner position.
         function _drawDiagramCached(ctx, opts) {
             const { opacity = 1, entranceT = 1.0, canvasW, canvasH } = opts;
-            if (opacity <= 0) return;
+            if (opacity <= 0) return 0;
             if (entranceT < 1.0) {
-                drawChordDiagram(ctx, opts);
-                return;
+                return drawChordDiagram(ctx, opts) || 0;
             }
-            const { name, frets, nStr, inverted, sizeSlider, position, lyricsBottom = 0 } = opts;
+            const { name, frets, nStr, inverted, sizeSlider, position, lyricsBottom = 0, stackOffset = 0 } = opts;
             const key = name + '|' + (frets || []).join(',') + '|' + nStr + '|' +
                         (inverted ? 1 : 0) + '|' + sizeSlider + '|' + position + '|' +
-                        canvasW + '|' + canvasH + '|' + lyricsBottom;
-            let oc = _diagRenderCache.get(key);
-            if (!oc) {
+                        canvasW + '|' + canvasH + '|' + lyricsBottom + '|' + stackOffset;
+            let entry = _diagRenderCache.get(key);
+            if (!entry) {
+                let oc;
                 try { oc = new OffscreenCanvas(canvasW, canvasH); }
                 catch (_) { oc = document.createElement('canvas'); oc.width = canvasW; oc.height = canvasH; }
-                drawChordDiagram(oc.getContext('2d'), { ...opts, opacity: 1, entranceT: 1 });
+                const boxH = drawChordDiagram(oc.getContext('2d'), { ...opts, opacity: 1, entranceT: 1 }) || 0;
                 if (_diagRenderCache.size >= _DIAG_CACHE_MAX) {
                     _diagRenderCache.delete(_diagRenderCache.keys().next().value);
                 }
-                _diagRenderCache.set(key, oc);
+                entry = { oc, boxH };
+                _diagRenderCache.set(key, entry);
             }
             ctx.save();
             ctx.globalAlpha = opacity;
-            ctx.drawImage(oc, 0, 0);
+            ctx.drawImage(entry.oc, 0, 0);
             ctx.restore();
+            return entry.boxH;
         }
 
         // Two-line section card. Top line is "Now: <current>", bottom line
@@ -3585,6 +3704,7 @@
                 position = 'tr',
                 sizeSlider = 0.5,
                 lyricsBottom = 0,
+                stackOffset = 0,
             } = opts;
             if (!sections || !sections.length) return 0;
 
@@ -3698,10 +3818,10 @@
             const E = Math.round(baseH * 0.25);
             const TOP_Y = Math.round(Math.max(E + canvasH * 0.06, lyricsBottom + E));
             let bx, by;
-            if      (position === 'tr') { bx = canvasW - boxW - E; by = TOP_Y; }
-            else if (position === 'bl') { bx = E; by = canvasH - boxH - E; }
-            else if (position === 'br') { bx = canvasW - boxW - E; by = canvasH - boxH - E; }
-            else                        { bx = E; by = TOP_Y; }
+            if      (position === 'tr') { bx = canvasW - boxW - E; by = TOP_Y + stackOffset; }
+            else if (position === 'bl') { bx = E; by = canvasH - boxH - E - stackOffset; }
+            else if (position === 'br') { bx = canvasW - boxW - E; by = canvasH - boxH - E - stackOffset; }
+            else                        { bx = E; by = TOP_Y + stackOffset; }
             bx = Math.max(0, Math.min(canvasW - boxW, bx));
             by = Math.max(0, Math.min(canvasH - boxH, by));
             // Suppress overlap with the wrapped lyrics banner regardless
@@ -3735,6 +3855,165 @@
                 ctx.font = `bold ${nameSize}px sans-serif`;
                 ctx.fillStyle = NAME_COLOR;
                 ctx.fillText(nowName, lineX + tagNowW + TAG_GAP, lineY);
+                lineY += lineH;
+            }
+            if (nextName) {
+                ctx.font = `${tagSize}px sans-serif`;
+                ctx.fillStyle = TAG_COLOR;
+                ctx.fillText(TAG_NEXT, lineX, lineY);
+                const nextX = lineX + tagNextW + TAG_GAP;
+                ctx.font = `bold ${nameSize}px sans-serif`;
+                ctx.fillStyle = NAME_COLOR;
+                ctx.fillText(nextName, nextX, lineY);
+                if (nextCountdown) {
+                    ctx.font = `${tagSize}px sans-serif`;
+                    ctx.fillStyle = TIME_COLOR;
+                    ctx.fillText(nextCountdown, nextX + nextNameW + TAG_GAP, lineY);
+                }
+            }
+            ctx.restore();
+            return boxH;
+        }
+
+        // Tone-change HUD — card showing the active tone and the next upcoming
+        // tone with a countdown. Mirrors drawSectionHud's layout contract
+        // (position, size slider, lyricsBottom) but uses an amber accent colour
+        // so it reads as distinct from the cyan section card.
+        function drawToneHud(ctx, opts) {
+            const {
+                toneChanges, toneBase = '',
+                currentTime,
+                canvasW, canvasH,
+                position = 'tl',
+                sizeSlider = 0.5,
+                lyricsBottom = 0,
+                stackOffset = 0,
+            } = opts;
+
+            // Resolve active tone: toneBase before all changes, else the most
+            // recent change at or before currentTime.
+            // toneChanges items use { t, name } (not { time, name }) — both
+            // the PSARC path (server.py xml_tone_changes) and the sloppak
+            // path (lib/tones.py sloppak_tone_changes) emit "t" as the key.
+            let curName = toneBase;
+            let nextChange = null;
+            if (toneChanges && toneChanges.length) {
+                for (let i = 0; i < toneChanges.length; i++) {
+                    if (toneChanges[i].t <= currentTime) {
+                        curName = toneChanges[i].name;
+                    } else {
+                        nextChange = toneChanges[i];
+                        break;
+                    }
+                }
+            }
+            if (!curName && !nextChange) return 0;
+
+            let nextName = '';
+            let nextCountdown = '';
+            if (nextChange) {
+                const dt = nextChange.t - currentTime;
+                nextName = nextChange.name;
+                nextCountdown = dt > 10
+                    ? 'in ' + Math.round(dt) + 's'
+                    : 'in ' + Math.max(0, dt).toFixed(1) + 's';
+            }
+
+            const sizeF = 0.65 + 0.85 * sizeSlider;
+            const baseH = Math.max(34, Math.min(72, Math.round(canvasH * 0.085 * sizeF)));
+            const PAD_X = Math.round(baseH * 0.45);
+            const PAD_Y = Math.round(baseH * 0.20);
+            let textScale = 1.0;
+            const baseLineH    = Math.round(baseH * 0.46);
+            const baseNameSize = Math.round(baseH * 0.36);
+            const baseTagSize  = Math.round(baseH * 0.24);
+            const baseTagGap   = Math.round(baseH * 0.14);
+
+            const TAG_CUR  = 'Tone:';
+            const TAG_NEXT = 'Next:';
+
+            ctx.save();
+            ctx.font = `${baseTagSize}px sans-serif`;
+            const tagCurWBase  = ctx.measureText(TAG_CUR).width;
+            const tagNextWBase = ctx.measureText(TAG_NEXT).width;
+            const countdownWBase = nextCountdown ? ctx.measureText(nextCountdown).width : 0;
+            ctx.font = `bold ${baseNameSize}px sans-serif`;
+            const curNameWBase  = curName  ? ctx.measureText(curName).width  : 0;
+            const nextNameWBase = nextName ? ctx.measureText(nextName).width : 0;
+            ctx.restore();
+
+            const lineCurWBase  = curName  ? tagCurWBase  + baseTagGap + curNameWBase  : 0;
+            const lineNextWBase = nextName
+                ? tagNextWBase + baseTagGap + nextNameWBase
+                  + (nextCountdown ? baseTagGap + countdownWBase : 0)
+                : 0;
+            const contentWBase = Math.max(lineCurWBase, lineNextWBase);
+            const numLines = (curName ? 1 : 0) + (nextName ? 1 : 0);
+            if (numLines === 0) return 0;
+
+            const maxBoxW = Math.max(40, canvasW - 16);
+            const availContentW = Math.max(1, maxBoxW - PAD_X * 2);
+            if (contentWBase > availContentW) {
+                textScale = Math.max(0.55, availContentW / contentWBase);
+            }
+
+            const lineH    = Math.max(1, Math.round(baseLineH    * textScale));
+            const nameSize = Math.max(1, Math.round(baseNameSize * textScale));
+            const tagSize  = Math.max(1, Math.round(baseTagSize  * textScale));
+            const TAG_GAP  = Math.max(1, Math.round(baseTagGap   * textScale));
+
+            ctx.save();
+            ctx.font = `${tagSize}px sans-serif`;
+            const tagCurW  = ctx.measureText(TAG_CUR).width;
+            const tagNextW = ctx.measureText(TAG_NEXT).width;
+            const countdownW = nextCountdown ? ctx.measureText(nextCountdown).width : 0;
+            ctx.font = `bold ${nameSize}px sans-serif`;
+            const curNameW  = curName  ? ctx.measureText(curName).width  : 0;
+            const nextNameW = nextName ? ctx.measureText(nextName).width : 0;
+            ctx.restore();
+
+            const lineCurW  = curName  ? tagCurW  + TAG_GAP + curNameW  : 0;
+            const lineNextW = nextName
+                ? tagNextW + TAG_GAP + nextNameW + (nextCountdown ? TAG_GAP + countdownW : 0)
+                : 0;
+            const contentW = Math.max(lineCurW, lineNextW);
+
+            const boxW = Math.min(maxBoxW, Math.round(contentW + PAD_X * 2));
+            const boxH = Math.round(numLines * lineH + PAD_Y * 2);
+
+            const E = Math.round(baseH * 0.25);
+            const TOP_Y = Math.round(Math.max(E + canvasH * 0.06, lyricsBottom + E));
+            let bx, by;
+            if      (position === 'tr') { bx = canvasW - boxW - E; by = TOP_Y + stackOffset; }
+            else if (position === 'bl') { bx = E; by = canvasH - boxH - E - stackOffset; }
+            else if (position === 'br') { bx = canvasW - boxW - E; by = canvasH - boxH - E - stackOffset; }
+            else                        { bx = E; by = TOP_Y + stackOffset; } // 'tl' default
+            bx = Math.max(0, Math.min(canvasW - boxW, bx));
+            by = Math.max(0, Math.min(canvasH - boxH, by));
+            if (lyricsBottom > 0 && by < lyricsBottom) return 0;
+
+            ctx.save();
+            ctx.fillStyle = 'rgba(8, 14, 22, 0.88)';
+            ctx.beginPath(); ctx.roundRect(bx, by, boxW, boxH, 7); ctx.fill();
+            ctx.strokeStyle = 'rgba(255,255,255,0.15)'; ctx.lineWidth = 1;
+            ctx.beginPath(); ctx.roundRect(bx, by, boxW, boxH, 7); ctx.stroke();
+
+            ctx.textBaseline = 'middle';
+            ctx.textAlign = 'left';
+
+            const lineX = bx + PAD_X;
+            let lineY = by + PAD_Y + lineH / 2;
+            const TAG_COLOR  = 'rgba(180,190,205,0.85)';
+            const NAME_COLOR = '#ff9a3c'; // amber — distinct from section cyan
+            const TIME_COLOR = 'rgba(220,225,235,0.9)';
+
+            if (curName) {
+                ctx.font = `${tagSize}px sans-serif`;
+                ctx.fillStyle = TAG_COLOR;
+                ctx.fillText(TAG_CUR, lineX, lineY);
+                ctx.font = `bold ${nameSize}px sans-serif`;
+                ctx.fillStyle = NAME_COLOR;
+                ctx.fillText(curName, lineX + tagCurW + TAG_GAP, lineY);
                 lineY += lineH;
             }
             if (nextName) {
@@ -4088,6 +4367,14 @@
             mAccentHaloNear = mkAccentHaloMats(ACCENT_HALO_OP_NEAR);
             mAccentHaloMid = mkAccentHaloMats(ACCENT_HALO_OP_MID);
             mAccentHaloFar = mkAccentHaloMats(ACCENT_HALO_OP_FAR);
+            // Frozen per-string shell descriptors — see _accentShellsByString
+            // declaration. Materials live for the renderer's lifetime, so
+            // these refs stay valid until teardown() clears them.
+            _accentShellsByString = mAccentHaloFar.map((_, s) => Object.freeze([
+                Object.freeze({ mat: mAccentHaloFar[s],  ixy: ACCENT_HALO_XY_OUTER, iz: ACCENT_HALO_Z_OUTER, zK: 0.012 }),
+                Object.freeze({ mat: mAccentHaloMid[s],  ixy: ACCENT_HALO_XY_MID,   iz: ACCENT_HALO_Z_MID,   zK: 0.008 }),
+                Object.freeze({ mat: mAccentHaloNear[s], ixy: ACCENT_HALO_XY_INNER, iz: ACCENT_HALO_Z_INNER, zK: 0.005 }),
+            ]));
             // Chord/arpeggio frame accent bloom — single gradient bar geometry.
             // The 4 bloom shells (expand=1.00/1.10/1.25/1.45, op=0.90/0.65/0.38/0.18)
             // are baked into vertex colours as their additive sum at each Y level,
@@ -4188,7 +4475,7 @@
                 m.visible = false;
                 // Board projection ghost frame. depthTest:false above, so
                 // renderOrder alone decides stacking — keep it above the
-                // chord frame (12/13) but below note gems (20/21) so it
+                // sus trails (12/13) but below note gems (20/21) so it
                 // stays visible on the fretboard without covering notes.
                 m.renderOrder = 14;
                 noteG.add(m);
@@ -4274,11 +4561,14 @@
             // Unit plane (1×1 in XZ) laid flat; scaled to (railWidth, 1, railLen).
             // A horizontal plane seen from the camera looking down-forward is
             // face-on and has real apparent thickness — unlike T.Line (always 1px).
-            // depthTest:false so they never occlude gems; renderOrder 16 places
-            // them above lane dividers (2), chord fill (10), chord frame edges
-            // (11), and sustain trails (12/13), but below note gems (dynamic
-            // ≥50) and arp brackets (18). The bloom halo (14) sits between the
-            // sustain trails and the rail core. (Bumped from 6→16 in 69fcd0f.)
+            // depthTest:false so they never occlude gems; renderOrder 11 places
+            // them above lane dividers (2) and chord fill (10), at the same level
+            // as chord frame edges (11), and BELOW sustain trails (12/13), note
+            // gems (dynamic ≥50), and arp brackets (18). The bloom halo (10) sits
+            // behind the core rail (11). Keeping susrail behind note sus trails
+            // prevents the rail border from covering individual note tails
+            // (sustain/vibrato/tremolo/bend). (Was 14/16 which rendered on top of
+            // 12/13 sus trails, causing the outer border to overlap tails.)
             gSusRail = new T.PlaneGeometry(1, 1);
             gSusRail.rotateX(-Math.PI / 2); // lay flat in XZ plane
             mSusRailBase = new T.MeshBasicMaterial({
@@ -4289,14 +4579,14 @@
             });
             pSusRail = pool(noteG, () => {
                 const m = new T.Mesh(gSusRail, mSusRailBase.clone());
-                m.renderOrder = 16;
+                m.renderOrder = 11;
                 return m;
             });
 
             // Bloom glow for chord sustain rails — wider plane with a gaussian
             // falloff texture (bright centre → transparent edges in X direction)
             // and additive blending, so it brightens whatever is behind it.
-            // renderOrder 14 places it behind the core rail (16).
+            // renderOrder 10 places it behind the core rail (11).
             _bloomGaussTex = _makeGaussTex(T);
             gSusRailBloom = new T.PlaneGeometry(1, 1);
             gSusRailBloom.rotateX(-Math.PI / 2);
@@ -4310,7 +4600,7 @@
             });
             pSusRailBloom = pool(noteG, () => {
                 const m = new T.Mesh(gSusRailBloom, mSusRailBloomBase.clone());
-                m.renderOrder = 14;
+                m.renderOrder = 10;
                 return m;
             });
 
@@ -4375,7 +4665,10 @@
                 color: ARPEGGIO_RIM_BLUE_HEX,
                 transparent: true, opacity: 0.08, fog: false, depthWrite: false,
             });
-            _ownedSharedMats.push(mLaneDivider, mLaneDividerArp);
+            mLaneDividerExt = new T.MeshBasicMaterial({
+                color: 0x364D5F, transparent: true, opacity: 0.4, fog: false, depthWrite: false,
+            });
+            _ownedSharedMats.push(mLaneDivider, mLaneDividerArp, mLaneDividerExt);
             pLaneDivider = pool(noteG, () => new T.Mesh(gLaneDivider, mLaneDivider));
 
             // Chord frame palette (frame alpha 128, fill gradient alpha 32; MeshBasic).
@@ -4678,7 +4971,12 @@
             ));
 
             // Per-note fret number below note with connector line
-            pNoteFretLabel = pool(lblG, () => new T.Sprite(txtMat('0', FRET_LABEL_GOLD_HEX, false, 'noteFret').clone()));
+            pNoteFretLabel = pool(lblG, () => {
+                const _nfl = new T.Sprite(txtMat('0', FRET_LABEL_GOLD_HEX, false, 'noteFret').clone());
+                // fog=false: same as pFretColMarker — opacity fade-in handles appearance.
+                _nfl.material.fog = false;
+                return _nfl;
+            });
             pConnectorLine = pool(noteG, () => new T.Line(
                 new T.BufferGeometry().setFromPoints([new T.Vector3(0, 0, 0), new T.Vector3(0, 1, 0)]),
                 new T.LineBasicMaterial({ color: 0xaaaaaa, transparent: true, opacity: 0.5 }),
@@ -4692,7 +4990,19 @@
             // Each sprite gets its own clone so the per-frame material.map swap
             // (dark vs light grey) doesn't poison neighbours sharing the same
             // cached texture map.
-            pFretColMarker = pool(lblG, () => new T.Sprite(txtMat('0', '#666666', false, 'noteFret').clone()));
+            // fog:false prevents the scene fog from gradually dimming the sprite
+            // as it enters the far end of the highway — opacity is managed
+            // manually with a short fade-in so the number appears at its
+            // final size the moment it becomes visible rather than seeming to
+            // emerge from a tiny dim spec at the horizon.
+            pFretColMarker = pool(lblG, () => {
+                const _sp = new T.Sprite(txtMat('0', '#666666', false, 'noteFret').clone());
+                // fog=false: prevents scene fog from dimming the sprite as it enters the
+                // far end of the highway.  Opacity is managed by the manual fade-in ramp
+                // so the number appears smoothly instead of emerging as a dim spec.
+                _sp.material.fog = false;
+                return _sp;
+            });
 
             // ── Pre-warm pools (slopsmith#226) ─────────────────────────────
             // Dense 7/8-string charts can outrun the lazy-grow path in the
@@ -5003,6 +5313,9 @@
             textSize             = _bgReadSetting(panelKey, 'textSize');
             vibrancy             = _bgReadSetting(panelKey, 'vibrancy');
             glowMul              = _bgReadSetting(panelKey, 'glow');
+            fpsVisible           = _bgReadSetting(panelKey, 'fpsVisible');
+            fretDividersVisible  = _bgReadSetting(panelKey, 'fretDividersVisible');
+            chordDiagramVisible  = _bgReadSetting(panelKey, 'chordDiagramVisible');
             chordDiagramSize     = _bgReadSetting(panelKey, 'chordDiagramSize');
             chordDiagramPosition = _bgReadSetting(panelKey, 'chordDiagramPosition');
             fretColumnMarkerCadence = _bgReadSetting(panelKey, 'fretColumnMarkerCadence');
@@ -5011,6 +5324,9 @@
             sectionHudVisible      = _bgReadSetting(panelKey, 'sectionHudVisible');
             sectionHudPosition     = _bgReadSetting(panelKey, 'sectionHudPosition');
             sectionHudSize         = _bgReadSetting(panelKey, 'sectionHudSize');
+            toneHudVisible         = _bgReadSetting(panelKey, 'toneHudVisible');
+            toneHudPosition        = _bgReadSetting(panelKey, 'toneHudPosition');
+            toneHudSize            = _bgReadSetting(panelKey, 'toneHudSize');
             nutHeadstockVisible    = _bgReadSetting(panelKey, 'nutHeadstockVisible');
             tuningLabelsVisible    = _bgReadSetting(panelKey, 'tuningLabelsVisible');
             nutColor               = _bgReadSetting(panelKey, 'nutColor');
@@ -5329,7 +5645,7 @@
                 const pts = [new T.Vector3(boardStringStartX, sY(s), 0), new T.Vector3(stringEndX, sY(s), 0)];
                 const g = new T.BufferGeometry().setFromPoints(pts);
                 const line = new T.Line(g, new T.LineBasicMaterial({ color: activePalette[s], transparent: true, opacity: lineGlowOp }));
-                line.renderOrder = 7; // below sus rails (14/16), below chord fill (10)
+                line.renderOrder = 7; // below sus rails (10/11), below chord fill (10)
                 fretG.add(line);
                 stringLineGlows.push(line);
             }
@@ -5345,7 +5661,7 @@
                     transparent: true, opacity: _vibrancyIdleOp, roughness: 1,
                 });
                 const mesh = new T.Mesh(g, mat);
-                mesh.renderOrder = 7; // below sus rails (14/16), below chord fill (10)
+                mesh.renderOrder = 7; // below sus rails (10/11), below chord fill (10)
                 mesh.position.set(boardStringStartX + strSpan * 0.5, sY(s), 0);
                 fretG.add(mesh);
                 stringLines.push(mesh);
@@ -5808,13 +6124,29 @@
          * Matching hand-shape metadata for a chord onset. ``explicit`` follows
          * authored arpeggio markers only; note inference is handled separately
          * by the callers that still need it for non-visual behavior.
+         *
+         * Cached per chord: result depends only on (ch, hss, chordTemplates),
+         * all chart-static for the lifetime of an arrangement. The cache is
+         * swapped on (hss, templates) ref change so an arrangement switch
+         * cannot resurrect stale entries. Empty-input case bypasses the cache
+         * — it returns a fresh sentinel anyway and isn't hot enough to share.
          */
+        const _HINT_NONE = Object.freeze({ explicit: false, covered: false, hs: null });
+        let _hintCache = new WeakMap();
+        let _hintCacheHsRef = null;
+        let _hintCacheTplRef = null;
         function chordHandShapeArpeggioHint(ch, hss, chordTemplates) {
-            if (!hss || hss.length === 0) {
-                return { explicit: false, covered: false, hs: null };
+            if (!hss || hss.length === 0) return _HINT_NONE;
+            if (_hintCacheHsRef !== hss || _hintCacheTplRef !== chordTemplates) {
+                _hintCache = new WeakMap();
+                _hintCacheHsRef = hss;
+                _hintCacheTplRef = chordTemplates;
             }
+            const cached = _hintCache.get(ch);
+            if (cached !== undefined) return cached;
             const t = ch.t;
             const cid = ch.id;
+            let result = _HINT_NONE;
             for (let i = 0; i < hss.length; i++) {
                 const hs = hss[i];
                 const tLo = hsStart(hs);
@@ -5824,9 +6156,11 @@
                 const hsCid = hsChordIdNorm(hs);
                 if (hsCid !== cid && Number(hsCid) !== Number(cid)) continue;
                 const explicit = handShapeMarkedArpeggio(hs, chordTemplates);
-                return { explicit, covered: true, hs };
+                result = { explicit, covered: true, hs };
+                break;
             }
-            return { explicit: false, covered: false, hs: null };
+            _hintCache.set(ch, result);
+            return result;
         }
 
         /** Build ``ch.notes`` from ``chordTemplates[cid].frets`` (-1 omitted). */
@@ -6006,8 +6340,35 @@
          *        When set (e.g. from ``<handShape>`` span), scan staggered picks
          *        across the whole held-shape window — RS often omits ``arp`` and ``hd``.
          */
-        function inferArpeggioFromNotePattern(ch, shape, notesArr, timeWin) {
+        // Cached per chord: result depends on (ch, shape, notesArr) and an
+        // optional timeWin which itself is a function of the chord's matching
+        // <handShape>. Both inputs are chart-static, so the cache invalidates
+        // on (notesArr, hss) ref change — `hss` is threaded in purely as the
+        // invalidation key for the chord-loop caller, which passes a stable
+        // `ch` (reused across frames) and a timeWin that is null until
+        // bundle.handShapes arrives over the WS; without the hss check the
+        // null-timeWin result would stick once handShapes loaded late. shape
+        // comes from mergeChordShape(ch) which is also chart-static, so it
+        // doesn't enter the invalidation key directly. The cache deliberately
+        // stores boolean results; a sentinel distinguishes "not computed"
+        // from "false".
+        let _arpInferCache = new WeakMap();
+        let _arpInferCacheNotesRef = null;
+        let _arpInferCacheHssRef = null;
+        function inferArpeggioFromNotePattern(ch, shape, notesArr, timeWin, hss = null) {
             if (!notesArr || notesArr.length === 0 || shape.size < 2) return false;
+            if (_arpInferCacheNotesRef !== notesArr || _arpInferCacheHssRef !== hss) {
+                _arpInferCache = new WeakMap();
+                _arpInferCacheNotesRef = notesArr;
+                _arpInferCacheHssRef = hss;
+            }
+            const cached = _arpInferCache.get(ch);
+            if (cached !== undefined) return cached;
+            const result = _inferArpeggioFromNotePatternUncached(ch, shape, notesArr, timeWin);
+            _arpInferCache.set(ch, result);
+            return result;
+        }
+        function _inferArpeggioFromNotePatternUncached(ch, shape, notesArr, timeWin) {
             const tHi = timeWin ? timeWin.tHi : ch.t + 2.35;
             const tLo = timeWin ? timeWin.tLo : ch.t - 0.28;
             let i2 = lowerBoundT(notesArr, tLo - 0.02);
@@ -6045,12 +6406,26 @@
          * arpeggio shape, so drawing the chord gems too would duplicate the same
          * authored passage.
          */
+        // Cached per chord: result depends on (ch, shape, notesArr) — chart-
+        // static; the cache invalidates on notesArr ref change. The same
+        // ``ch`` may be queried multiple times per frame from the chord
+        // render loop (deferChordGems / _deferFallback / suppressSynthChord),
+        // so survival across frames is also useful.
+        let _arpCoverCache = new WeakMap();
+        let _arpCoverCacheNotesRef = null;
         function chordShapeCoveredByStandaloneNotes(ch, shape, notesArr, timeWin) {
             if (!notesArr || notesArr.length === 0 || !shape || shape.size === 0) return false;
+            if (_arpCoverCacheNotesRef !== notesArr) {
+                _arpCoverCache = new WeakMap();
+                _arpCoverCacheNotesRef = notesArr;
+            }
+            const cached = _arpCoverCache.get(ch);
+            if (cached !== undefined) return cached;
             const tLo = (timeWin ? timeWin.tLo : ch.t - ARP_FRAME_ONSET_PAD_S) - NEXT_ON_STRING_T_EPS;
             const tHi = (timeWin ? timeWin.tHi : ch.t + ARP_FRAME_ONSET_CLUSTER_S) + NEXT_ON_STRING_T_EPS;
             let i2 = lowerBoundT(notesArr, tLo);
             const matchedStrings = new Set();
+            let result = false;
             for (; i2 < notesArr.length; i2++) {
                 const n = notesArr[i2];
                 if (n.t > tHi) break;
@@ -6058,9 +6433,10 @@
                 const ef = shape.get(n.s);
                 if (ef === undefined || ef !== n.f) continue;
                 matchedStrings.add(n.s);
-                if (matchedStrings.size >= shape.size) return true;
+                if (matchedStrings.size >= shape.size) { result = true; break; }
             }
-            return false;
+            _arpCoverCache.set(ch, result);
+            return result;
         }
 
         /**
@@ -6089,7 +6465,7 @@
                 const shape = mergeChordShape(fakeCh, synthNotes, chordTemplates);
                 const tw = { tLo: hsLo - 0.06, tHi: hsHi + 0.06 };
                 if (handShapeChartSpanSec(hs) < ARP_INFER_MIN_HAND_SHAPE_SPAN_S) continue;
-                if (inferArpeggioFromNotePattern(fakeCh, shape, notesArr, tw)) return cid;
+                if (inferArpeggioFromNotePattern(fakeCh, shape, notesArr, tw, handShapes)) return cid;
             }
             return null;
         }
@@ -6119,7 +6495,7 @@
                             const fakeCh = { t: hsLo, id: cid, notes: synthNotes };
                             const shape = mergeChordShape(fakeCh, synthNotes, chordTemplates);
                             const tw = { tLo: hsLo - 0.06, tHi: hsHi + 0.06 };
-                            infer = inferArpeggioFromNotePattern(fakeCh, shape, notesArr, tw);
+                            infer = inferArpeggioFromNotePattern(fakeCh, shape, notesArr, tw, handShapes);
                             // Chord-hold gate: inferArpeggioFromNotePattern can fire true
                             // when open-string notes coincidentally match the template's
                             // open positions but only a SINGLE fretted (f>0) string is
@@ -6510,13 +6886,15 @@
             // re-encounters a chord, so without this prune the map would
             // grow unbounded for the rest of the song (each chord onset
             // contributes one entry, ~hundreds for a typical song).
-            // verdictKey format is `${ch.id}|${ch.t}` (or `_|${ch.t}` when
-            // ch.id is null), so parse the t after the last '|'.
+            // verdictKey is now an integer encoded by _encodeChordVerdictKey
+            // — time component sits in the upper bits, so a direct
+            // ``k < pruneBeforeKey`` test prunes correctly without
+            // parseFloat / String.slice on every entry.
             //
             // Backward seek (now < lastNow): every latched entry's
-            // parsedT is now ahead of `now`, the forward-only check below
-            // would skip them all and the map would grow on every loop.
-            // Clear wholesale — the chord-loop's `chDt > 0` eviction
+            // chord time is now ahead of `now`, the forward-only check
+            // below would skip them all and the map would grow on every
+            // loop. Clear wholesale — the chord-loop's `chDt > 0` eviction
             // re-creates entries as chords re-enter the pre-hit window.
             //
             // Forward playback: iterate every entry. An earlier `break`
@@ -6539,13 +6917,9 @@
                     // already cleared above
                 } else {
                     const pruneBefore = ndVerdictT0 - 0.5; // safety margin
+                    const pruneBeforeKey = Math.round(pruneBefore * _CV_KEY_TIME_MUL) * _CV_KEY_TIME_SLOT;
                     for (const k of _chordVerdicts.keys()) {
-                        const pipeIdx = k.lastIndexOf('|');
-                        if (pipeIdx < 0) continue;
-                        const parsedT = parseFloat(k.slice(pipeIdx + 1));
-                        if (Number.isFinite(parsedT) && parsedT < pruneBefore) {
-                            _chordVerdicts.delete(k);
-                        }
+                        if (k < pruneBeforeKey) _chordVerdicts.delete(k);
                     }
                 }
             }
@@ -6922,6 +7296,28 @@
                 _drawRecentByString = _recArr;
             }
 
+            // ── Sorted union of next/recent event times ──────────────────
+            // Populate the scalar scratch used by _firstEventTimeGreaterThan
+            // — at most 2 * nStr finite values, then sorted ascending.
+            // Float64Array.subarray returns a view, so .sort() runs in place
+            // over the live prefix without copying or allocating.
+            // Pulls directly from _drawNextByString / _drawRecentByString
+            // (closure-scoped, populated just above) so we're independent of
+            // the recent-event prepass's inner-block ``_recArr`` alias.
+            _scrEventTimesLen = 0;
+            for (let s = 0; s < nStr; s++) {
+                const nf = _drawNextByString[s];
+                if (nf) {
+                    const tn = nf.t;
+                    if (Number.isFinite(tn)) _scrEventTimes[_scrEventTimesLen++] = tn;
+                }
+                const rt = _drawRecentByString[s];
+                if (Number.isFinite(rt)) _scrEventTimes[_scrEventTimesLen++] = rt;
+            }
+            if (_scrEventTimesLen > 1) {
+                _scrEventTimes.subarray(0, _scrEventTimesLen).sort();
+            }
+
             // ── Ghost preview gap prepass ──────────────────────────────────
             // For each note/chord in the upcoming 0.65s window, record the
             // onset time of its immediate predecessor on the same string.
@@ -7281,7 +7677,11 @@
                     // The sustain/slide trail still renders because it now lives outside
                     // the !skipBody gate in drawNote().
                     const _isSlideTgt = !!(_slideTargetSet && _slideTargetSet.has(_noteKey(n.t, n.s)));
-                    const skipLabel = lastFretForString[n.s] === n.f;
+                    // Always show the fret label — suppressing it for repeated frets on the same
+                    // string caused the label to be invisible throughout the note's flight and
+                    // only appear moments before being played (when the previous note's linger
+                    // window expired).  Each note now owns its label for its full flight.
+                    const skipLabel = false;
                     let singleOpenX;
                     if (n.f === 0) {
                         const ab = anchorLaneBoundsAt(anchors, n.t);
@@ -7484,9 +7884,18 @@
                     // Repeat-chord detection (consecutive same shape, short gap).
                     // Reuses runSig computed at loop entry — same signature as the
                     // dedicated chordShapeSignature() call we used to make twice.
+                    // Synthetic chords (h3dSynth — injected at handshape onsets by
+                    // mergeHandShapeSynthChords) are never real strums, so they must
+                    // not update prevChordSig/prevChordTime. Without this guard a
+                    // real chord whose handshape generates a synth onset at the
+                    // handshape start_time (e.g. a slide-in where the real strum
+                    // falls mid-handshape, > 28 ms after the onset) would see the
+                    // synth as its "previous chord" and be falsely flagged isRepeat.
                     const isRepeat = runSig !== null && prevChordSig === runSig && Math.abs(ch.t - prevChordTime) < 0.5;
-                    prevChordSig = runSig;
-                    prevChordTime = ch.t;
+                    if (!ch.h3dSynth) {
+                        prevChordSig = runSig;
+                        prevChordTime = ch.t;
+                    }
 
                     // Anchor selection for chord frame + open-string X + sustain rails:
                     // • Upcoming (chDtEarly > 0): onset time — frame previews the correct
@@ -7583,30 +7992,25 @@
                     const hsTimeWinFrame = hsHintFrame.hs
                         ? { tLo: hsStart(hsHintFrame.hs) - 0.06, tHi: hsEnd(hsHintFrame.hs) + 0.06 }
                         : null;
-                    // Lazy: the coverage scan walks the note stream and is only
-                    // consumed by the h3dSynth and explicit+covered branches of
-                    // `deferChordGems`; computing it eagerly for every chord
-                    // every frame regresses dense charts.
-                    let _arpCoverMemo;
-                    const noteStreamCoversArpShape = () => {
-                        if (_arpCoverMemo === undefined) {
-                            _arpCoverMemo = chordShapeCoveredByStandaloneNotes(
-                                ch,
-                                chShape,
-                                notes,
-                                { tLo: ch.t - ARP_FRAME_ONSET_PAD_S, tHi: ch.t + ARP_FRAME_ONSET_CLUSTER_S },
-                            );
-                        }
-                        return _arpCoverMemo;
-                    };
+                    // chordShapeCoveredByStandaloneNotes is now cached per
+                    // chord (see _arpCoverCache), so a direct call from the
+                    // deferChordGems short-circuit chain is both lazy
+                    // (skipped for branches that don't need it) AND O(1)
+                    // when re-hit later in the same frame. The previous
+                    // per-chord IIFE memo is therefore redundant — drop it
+                    // to avoid the per-chord closure allocation in dense
+                    // PM/FH passages.
                     const inferredArpPattern = (!hsHintFrame.hs
                         || handShapeChartSpanSec(hsHintFrame.hs) >= ARP_INFER_MIN_HAND_SHAPE_SPAN_S)
                         && inferArpeggioFromNotePattern(
-                            ch, chShape, notes, hsTimeWinFrame);
+                            ch, chShape, notes, hsTimeWinFrame, bundle.handShapes);
                     // Only suppress the chord gems when standalone notes really
                     // cover the arpeggio shape; otherwise explicit/synth hand
                     // shapes can produce an empty lavender frame with no notes
                     // inside (e.g. template-marked `-arp` chord rows).
+                    // Lazy wrapper so the note-stream scan is skipped when
+                    // neither branch needs it (short-circuit evaluation).
+                    const noteStreamCoversArpShape = () => chordShapeCoveredByStandaloneNotes(ch, chShape, notes);
                     const deferChordGems = (ch.h3dSynth && noteStreamCoversArpShape())
                         || inferredArpPattern
                         || (hsHintFrame.explicit && hsHintFrame.covered && noteStreamCoversArpShape());
@@ -7657,13 +8061,13 @@
                     // Nearest following event (chord OR single note) — used by
                     // chordTailMul so the framebox vanishes the moment any next
                     // event is played, not just when the next chord arrives.
-                    let _chNextEventT = cjNext != null ? cjNext.t : Infinity;
-                    for (let _si = 0; _si < nStr; _si++) {
-                        const _nf = _drawNextByString && _drawNextByString[_si];
-                        if (_nf && _nf.t > ch.t + 1e-6) _chNextEventT = Math.min(_chNextEventT, _nf.t);
-                        const _rt = _drawRecentByString && _drawRecentByString[_si];
-                        if (_rt > ch.t + 1e-6) _chNextEventT = Math.min(_chNextEventT, _rt);
-                    }
+                    // Pull from the same sorted scalar scratch used by drawNote
+                    // — the per-string Math.min walk became O(log N) over the
+                    // shared 2*nStr buffer.
+                    const _chFirstEventAfter = _firstEventTimeGreaterThan(ch.t + 1e-6);
+                    const _chNextEventT = cjNext != null
+                        ? Math.min(cjNext.t, _chFirstEventAfter)
+                        : _chFirstEventAfter;
                     let chordTailHoldS = CHORD_HWY_LINGER_S;
                     let chordNextSoon = false;
                     if (cjNext && cjNext.t > ch.t + 1e-6) {
@@ -7742,9 +8146,12 @@
                     // no individual note matching the chord shape falls within the chord's
                     // onset cluster window, the frame box has no gems at its Z position.
                     // Show all chord gems as a preview so the frame box isn't empty.
-                    // Uses the same onset window as noteStreamCoversArpShape so the
-                    // fallback deactivates precisely when the stream truly covers the onset.
-                    const _deferFallback = deferChordGems && chDtEarly > 0 && (() => {
+                    // Uses the same onset window as chordShapeCoveredByStandaloneNotes so
+                    // the fallback deactivates precisely when the stream truly covers the
+                    // onset. Inlined (not an IIFE) to skip the per-chord closure allocation.
+                    let _deferFallback = false;
+                    if (deferChordGems && chDtEarly > 0) {
+                        _deferFallback = true;
                         const _fLo = ch.t - ARP_FRAME_ONSET_PAD_S;
                         const _fHi = ch.t + ARP_FRAME_ONSET_CLUSTER_S;
                         let _fi = lowerBoundT(notes, _fLo - 0.02);
@@ -7753,22 +8160,22 @@
                             if (_fn.t > _fHi) break;
                             if (_fn.t < _fLo) continue;
                             const _fef = chShape.get(_fn.s);
-                            if (_fef !== undefined && _fef === _fn.f) return false;
+                            if (_fef !== undefined && _fef === _fn.f) { _deferFallback = false; break; }
                         }
-                        return true;
-                    })();
+                    }
 
                     // Suppress gems AND frame for hand-shape-synthesized chords whose
                     // notes are already rendered individually via the note stream. Showing
                     // chord gems or a framebox for a synth chord that duplicates the note
                     // stream looks like phantom notes/chords. Check: any standalone note
                     // matching any shape string in the onset window → player is already
-                    // guided by the note stream. Weaker than noteStreamCoversArpShape()
+                    // guided by the note stream. Weaker than chordShapeCoveredByStandaloneNotes
                     // (all strings covered) to handle patterns where one shape string only
                     // appears well after the onset cluster (e.g. Walk intro, string 5 at
-                    // +0.7 s outside the 0.26 s window).
-                    const suppressSynthChord = ch.h3dSynth && (() => {
-                        if (!notes || chShape.size === 0) return false;
+                    // +0.7 s outside the 0.26 s window). Inlined for the same reason as
+                    // _deferFallback above.
+                    let suppressSynthChord = false;
+                    if (ch.h3dSynth && notes && chShape.size > 0) {
                         const _sLo = ch.t - ARP_FRAME_ONSET_PAD_S;
                         const _sHi = ch.t + ARP_FRAME_ONSET_CLUSTER_S;
                         let _si = lowerBoundT(notes, _sLo - 0.02);
@@ -7776,10 +8183,9 @@
                             const _sn = notes[_si];
                             if (_sn.t > _sHi) break;
                             if (_sn.t < _sLo) continue;
-                            if (chShape.get(_sn.s) === _sn.f) return true;
+                            if (chShape.get(_sn.s) === _sn.f) { suppressSynthChord = true; break; }
                         }
-                        return false;
-                    })();
+                    }
 
                     // suppressSynthChord: skip gems + frame but still call drawNote with
                     // skipBody=true so the board projection (fret ghost on fretboard) renders
@@ -7793,7 +8199,9 @@
                             // pattern was found, so simultaneous chords are unaffected.
                             // suppressSynthChord: show all shape strings for the projection.
                             if (!_deferFallback && !suppressSynthChord && _arpApproachFirstNote !== null && cn !== _arpApproachFirstNote) continue;
-                            const skipLabel = !firstInShapeRun || lastFretForString[cn.s] === cn.f;
+                            // Only suppress labels on repeated chord shapes (not on first-in-run);
+                            // removed the lastFretForString check — same fix as single notes above.
+                            const skipLabel = !firstInShapeRun;
                             // Reuse _scrChordNote scratch instead of `{ ...cn }` spread
                             // (avoids per-chord-note object allocation every frame).
                             Object.assign(_scrChordNote, cn);
@@ -7958,7 +8366,7 @@
                         // (reused across same-shape chord occurrences) so
                         // composing it with ch.t gives one entry per
                         // physical onset in the chart.
-                        const verdictKey = ch.id != null ? `${ch.id}|${ch.t}` : `_|${ch.t}`;
+                        const verdictKey = _encodeChordVerdictKey(ch);
                         // Evict any stale latch the next time the chord
                         // re-enters the pre-hit window (rewinds, section
                         // loops, full restarts). Bounds Map growth too.
@@ -8107,7 +8515,7 @@
                         fill.material.map = isArpeggioFrame ? chordFrameGradTexArp : chordFrameGradTex;
                         fill.material.color.setRGB(1, 1, 1);
 
-                        // renderOrder 17/18 — above sustain trails (12/13) and rails (16), below note gems (50-700)
+                        // renderOrder 17/18 — above sustain trails (12/13) and rails (10/11), below note gems (50-700)
                         drawFrameBox(cx, yBot + ft * 0.5, width, ft, 17);
                         const withTopFrame = !isRepeat;
                         // Non-repeat tapers the upper side bars + draws a thin top bar;
@@ -8327,7 +8735,7 @@
                         // ── Frethand-mute strum indicator — FH X outline + dark fill ───
                         // Fill: pFHXFill (1 draw call). Lines: pFHXLines (1 draw call).
                         // L/R wings stop at fx=±0.50 — no solid lateral fill blocks.
-                        if (isRepeat && chordNotes.some(cn => cn.mt)) {
+                        if (isRepeat && chordNotes.some(cn => cn.mt || cn.fhm)) {
                             const fhf = pFHXFill.get();
                             fhf.renderOrder = 10.5;
                             fhf.rotation.set(0, 0, 0);
@@ -8350,12 +8758,15 @@
                     // Left + right rail as plane meshes (PlaneGeometry +
                     // MeshBasicMaterial) in the WebGL scene so they respect
                     // renderOrder (16) and never occlude note gems (20/21).
-                    if (chShape.size > 1 && chordOpenBoxW != null && !isRepeat && chDt < AHEAD) {
+                    // isRepeat chords also draw their rail: each repeat shows a
+                    // segment from its own onset to the next chord's onset (or the
+                    // handshape end, whichever is shorter), chaining together to
+                    // cover the full handshape duration visually.
+                    if (chShape.size > 1 && chordOpenBoxW != null && chDt < AHEAD) {
                         // Cap handshape-derived sustain at the gap to the next chord.
-                        // Without this, the first chord in a gallop group gets the
-                        // full handshape span (covering all repeats) as its sustain,
-                        // causing the rail to linger at the old anchor position while
-                        // subsequent chords appear at a different anchor position.
+                        // Each chord (including repeats) only extends to the next
+                        // chord's onset, so the rail never lingers past the anchor
+                        // region of the current chord.
                         const _nextChordGap = (ci + 1 < chords.length)
                             ? chords[ci + 1].t - ch.t
                             : Infinity;
@@ -8699,6 +9110,21 @@
                         }
                     }
                 }
+
+                // ── Fret boundary extension lines ─────────────────────────
+                if (mLaneDividerExt && fretDividersVisible) {
+                    const extLaneLen = TS * (AHEAD + BEHIND);
+                    const extZMid = -extLaneLen / 2 + TS * BEHIND;
+                    const extYPos = boardY + 0.03 * K;
+                    mLaneDividerExt.opacity = Math.max(0.3, 0.3 + highwayIntensity * 0.15);
+                    for (let f = 0; f <= NFRETS; f++) {
+                        const div = pLaneDivider.get();
+                        div.position.set(xFret(f), extYPos, extZMid);
+                        div.material = mLaneDividerExt;
+                        div.scale.set(1, 1, extLaneLen);
+                        div.renderOrder = 2;
+                    }
+                }
             }
 
             // ── Dynamic fret number row (heat-coloured) ───────────────────
@@ -8731,7 +9157,7 @@
                     lb.material    = txtMat(f, isGold ? FRET_LABEL_GOLD_HEX : FRET_LABEL_IDLE_HEX, false, 'fretRow');
                     lb.position.set(xFretMid(f), yBottom - S_GAP * 1.4, 0.5 * K);
                     lb.material.opacity = isGold ? 1.0 : 0.55;
-                    const scale = 3.5 * _textSizeMul * fretLabelScaleForFret(f);
+                    const scale = 7.0 * _textSizeMul * fretLabelScaleForFret(f);
                     lb.scale.set(scale * K, scale * K, 1);
                     lb.renderOrder = 1000;
                 }
@@ -8850,6 +9276,14 @@
                     if (!cached.hasLow && !cached.hasHigh && !cached.anchorKeyed) continue;
 
                     const dt = b.time - now;
+                    // Fade in over 0.35 s from the maximum lookahead distance so
+                    // the label appears at its correct final size the moment it
+                    // becomes visible, rather than gradually emerging as a tiny
+                    // dim spec through scene fog (fog is disabled on the sprite
+                    // material; this manual ramp replaces it).
+                    const _colFadeIn = Math.min(1.0, (AHEAD - dt) / 0.35);
+                    if (_colFadeIn <= 0) continue;
+
                     const z = dZ(dt);
                     // Sprite scale matches the per-note connector fret label
                     // (drawNote → pNoteFretLabel) so cadence markers read the
@@ -8869,19 +9303,30 @@
                         }
                         if (!show) continue;
                         if (!anchorKeyedRow && clipMin != null && (f <= clipMin || f > clipMax)) continue;
-                        const lit = activeFrets.has(f);
-                        const color = lit ? '#bbbbbb' : '#666666';
+                        // Fixed colour — avoids mid-flight colour flips caused by
+                        // activeFrets only covering now+2s while waves appear at
+                        // AHEAD (3s), which made each marker start dark then
+                        // suddenly jump to light when its note entered the 2s window.
+                        const color = '#888888';
                         const sp = pFretColMarker.get();
                         const m = txtMat(f, color, false, 'noteFret');
                         if (sp.material.map !== m.map) {
                             sp.material.map = m.map;
                             sp.material.needsUpdate = true;
                         }
-                        sp.material.opacity = 0.85;
+                        sp.material.opacity = 0.85 * _colFadeIn;
                         sp.position.set(xFretMid(f), labelY, z);
-                        const sz = NH * 2.2 * _textSizeMul * fretLabelScaleForFret(f);
+                        // renderOrder > beat lines (0) so the label always draws on top,
+                        // avoiding the transparent-sort artefact where the beat line
+                        // washes over the label and makes it appear in a "dimmer" colour.
+                        sp.renderOrder = 5;
+                        // Scale grows linearly from 2× at max lookahead to 1× at hit line,
+                        // combined with natural perspective attenuation the label starts
+                        // visibly larger and converges to the row-label size at z=0.
+                        const sz = 7.0 * K * (1 + 0.4 * dt / AHEAD) * _textSizeMul * fretLabelScaleForFret(f);
                         sp.scale.set(sz, sz, 1);
                     }
+
                 }
             }
 
@@ -9239,18 +9684,14 @@
             const y = sY(s);
             const susEnd = n.t + (n.sus || 0);
             const hasSus = n.sus > 0;
-            // Nearest next note across ALL strings — used by both paths below.
-            // Also include _drawRecentByString so that once an event passes
-            // `now` (and leaves _drawNextByString) the deadline still holds:
-            // without this, the next future event resets _nextAnyT and old
-            // gems linger on screen after the new chord/note is already playing.
-            let _nextAnyT = Infinity;
-            for (let _si = 0; _si < nStr; _si++) {
-                const _nf = _drawNextByString && _drawNextByString[_si];
-                if (_nf && _nf.t > n.t + 1e-6) _nextAnyT = Math.min(_nextAnyT, _nf.t);
-                const _rt = _drawRecentByString && _drawRecentByString[_si];
-                if (_rt > n.t + 1e-6) _nextAnyT = Math.min(_nextAnyT, _rt);
-            }
+            // Nearest event time across ALL strings strictly after this note —
+            // sourced from the sorted union of next/recent event times built
+            // once per frame in update() (see _scrEventTimes). _drawRecentByString
+            // is folded in so that once an event passes `now` (and leaves
+            // _drawNextByString) the deadline still holds: without this the
+            // next future event would reset _nextAnyT and old gems would
+            // linger after the new chord/note is already playing.
+            const _nextAnyT = _firstEventTimeGreaterThan(n.t + 1e-6);
             // Deadline: absolute time after which the gem is culled.
             //   Sustain long (sus >= linger): die immediately at susEnd — no tail.
             //   Sustain short (sus < linger):  tail = linger - sus after susEnd,
@@ -9513,11 +9954,7 @@
                 // gem core material applies below.
                 if (n.ac && _ndState !== 'miss' && mAccentHaloNear[s]) {
                     const rZ = approachRot;
-                    const accentShells = [
-                        { mat: mAccentHaloFar[s], ixy: ACCENT_HALO_XY_OUTER, iz: ACCENT_HALO_Z_OUTER, zK: 0.012 },
-                        { mat: mAccentHaloMid[s], ixy: ACCENT_HALO_XY_MID, iz: ACCENT_HALO_Z_MID, zK: 0.008 },
-                        { mat: mAccentHaloNear[s], ixy: ACCENT_HALO_XY_INNER, iz: ACCENT_HALO_Z_INNER, zK: 0.005 },
-                    ];
+                    const accentShells = _accentShellsByString[s];
                     for (let hi = 0; hi < accentShells.length; hi++) {
                         const sh = accentShells[hi];
                         const glow = pAccentHalo.get();
@@ -9806,14 +10243,16 @@
                     }
                 }
                 // Tremolo label ('~~~') removed — trail shape already conveys it visually.
-                if (n.pm || n.mt) {
+                if (n.pm || n.mt || n.fhm) {
                     // Muted notes: on-body X overlay — PlaneGeometry mesh so it
                     // rotates with the gem (approachRot) instead of billboarding.
                     // Palm mute = black X / white border; fret-hand mute = inverse.
-                    const fretHandMute = !!n.mt;
+                    // `mt` (string mute) and `fhm` (fret-hand mute) both render the
+                    // fret-hand X; only a palm-mute-only note gets the inverse.
+                    const fretHandMute = !!(n.mt || n.fhm);
                     const muteSprite = fretHandMute
-                        ? muteXMat('#ffffff', '#000000')
-                        : muteXMat('#000000', '#ffffff');
+                        ? fretHandMuteXSpriteMat()
+                        : palmMuteXSpriteMat();
                     const muteMark = pTechPlane.get();
                     muteMark.material = _spriteMat2MeshMat(muteMark, muteSprite);
                     muteMark.material.opacity = hit ? 1.0 : 0.8;
@@ -9847,8 +10286,10 @@
                 if (n.f > 0 && !skipLabel) {
                     const minStringY = Math.min(sY(0), sY(nStr - 1));
                     const labelY = minStringY - S_GAP * 0.8;
-                    // fade out in the last 0.5 s so it doesn't overlap the fret-row label at Z=0
-                    const alpha = Math.max(0, Math.min(1, dt / 0.5)) * Math.min(1, (AHEAD - dt) / (AHEAD * 0.4));
+                    // Fade in over 0.35s at the far end; stay at full opacity until
+                    // the note hits (dt = 0).  No pre-hit fade-out — removing it
+                    // eliminates the "label disappears before the note arrives" artifact.
+                    const alpha = dt >= 0 ? Math.min(1.0, (AHEAD - dt) / 0.35) : 0;
 
                     const fretLabel  = pNoteFretLabel.get();
                     const cachedMat  = txtMat(n.f, FRET_LABEL_GOLD_HEX, false, 'noteFret');
@@ -9857,7 +10298,12 @@
                         fretLabel.material.needsUpdate = true;
                     }
                     fretLabel.position.set(x, labelY, noteZ);
-                    const flS = NH * 2.2 * _textSizeMul * fretLabelScaleForFret(n.f);
+                    // Render above beat lines so the label is never washed out by the
+                    // beat-line transparency pass.
+                    fretLabel.renderOrder = 5;
+                    // Same scale ramp as fret column markers: 2× base at max lookahead,
+                    // converging to 1× at hit line.  Final size matches row labels.
+                    const flS = 7.0 * K * (1 + 0.4 * Math.max(0, dt) / AHEAD) * _textSizeMul * fretLabelScaleForFret(n.f);
                     fretLabel.scale.set(flS, flS, 1);
                     fretLabel.material.opacity = alpha;
 
@@ -10273,7 +10719,7 @@
             if (ren) { ren.dispose(); ren = null; }
             scene = cam = noteG = beatG = lblG = fretG = tuningLblG = null;
             ambLight = dirLight = null;
-            mStr = []; mGlow = []; mSus = []; mStrHitOutline = []; mAccentOutline = []; mAccentCore = []; mAccentHaloNear = []; mAccentHaloMid = []; mAccentHaloFar = []; mWhiteOutline = mSusOutline = null; mMissOutline = null; mHitSusOutline = null; stringLines = []; stringLineGlows = [];
+            mStr = []; mGlow = []; mSus = []; mStrHitOutline = []; mAccentOutline = []; mAccentCore = []; mAccentHaloNear = []; mAccentHaloMid = []; mAccentHaloFar = []; _accentShellsByString = []; mWhiteOutline = mSusOutline = null; mMissOutline = null; mHitSusOutline = null; stringLines = []; stringLineGlows = [];
             for (const m of _inlayMats) m?.dispose?.(); _inlayMats = []; _inlayLabels = [];
             // mTapChevron: dispose explicitly — if no tap marker ever
             // spawned a pooled mesh, the scene.traverse() pass above never
@@ -10478,21 +10924,107 @@
                 ren.render(scene, cam);
                 if (lyricsCtx && lyricsCanvas) {
                     lyricsCtx.clearRect(0, 0, lyricsCanvas.width, lyricsCanvas.height);
-                    // Capture the actual lyrics-banner bottom so drawChordDiagram
-                    // can step down past every wrapped row, not just a 2-row estimate.
+                    // Capture the actual lyrics-banner bottom so overlay cards
+                    // step down past every wrapped row, not just a 2-row estimate.
                     let lyricsBottom = 0;
                     if (bundle.lyricsVisible && bundle.lyrics?.length) {
                         lyricsBottom = drawLyrics(bundle.lyrics, bundle.currentTime, lyricsCtx, lyricsCanvas.width, lyricsCanvas.height) || 0;
                     }
                     drawNotedetectLabels(lyricsCtx, lyricsCanvas.width, lyricsCanvas.height);
-                    // Draw outgoing diagram first so the incoming diagram renders on top,
+
+                    // Corner-stacking: overlays drawn first claim the topmost slot;
+                    // later overlays are pushed down by the accumulated height + gap.
+                    // Draw order (top → bottom per corner):
+                    //   1. FPS counter  — always first
+                    //   2. Section HUD
+                    //   3. Tone HUD
+                    //   4. Chord diagram — always last
+                    const STACK_GAP = 8;
+                    const cornerStack = { tl: 0, tr: 0, bl: 0, br: 0 };
+                    const stackPush = (pos, h) => {
+                        if (pos in cornerStack && h > 0) cornerStack[pos] += h + STACK_GAP;
+                    };
+
+                    // 1. FPS counter (always top-right, always topmost).
+                    // EMA update runs unconditionally so the smoothed value is accurate
+                    // even when fpsVisible is off.
+                    const _fpsNowMs = performance.now();
+                    if (_fpsLastT > 0) {
+                        const dt = _fpsNowMs - _fpsLastT;
+                        if (dt > 0) {
+                            const inst = 1000 / dt;
+                            _fpsEma = _fpsEma === 0 ? inst : _fpsEma + (inst - _fpsEma) * (1 / 30);
+                        }
+                    }
+                    _fpsLastT = _fpsNowMs;
+                    if (fpsVisible) {
+                        if (_fpsNowMs - _fpsLastSampleT > 250) {
+                            _fpsDisplay = _fpsEma;
+                            _fpsLastSampleT = _fpsNowMs;
+                        }
+                        const W = lyricsCanvas.width;
+                        const H = lyricsCanvas.height;
+                        const txt = _fpsDisplay.toFixed(1) + ' fps';
+                        lyricsCtx.save();
+                        lyricsCtx.font = 'bold 14px ui-monospace, Menlo, Consolas, monospace';
+                        lyricsCtx.textAlign = 'right';
+                        lyricsCtx.textBaseline = 'top';
+                        const _fpsPadX = 8, _fpsPadY = 4;
+                        const _fpsMetrics = lyricsCtx.measureText(txt);
+                        const _fpsBoxW = Math.ceil(_fpsMetrics.width) + _fpsPadX * 2;
+                        const _fpsBoxH = 14 + _fpsPadY * 2;
+                        const _fpsE = 8;
+                        const _fpsBaseY = Math.round(Math.max(_fpsE + H * 0.06, lyricsBottom + _fpsE));
+                        const _fpsX = W - 8 - _fpsBoxW;
+                        const _fpsY = _fpsBaseY + cornerStack['tr'];
+                        lyricsCtx.fillStyle = 'rgba(0,0,0,0.55)';
+                        lyricsCtx.fillRect(_fpsX, _fpsY, _fpsBoxW, _fpsBoxH);
+                        lyricsCtx.fillStyle = _fpsDisplay >= 55 ? '#7fff9a'
+                            : _fpsDisplay >= 30 ? '#ffe84d' : '#ff6b6b';
+                        lyricsCtx.fillText(txt, _fpsX + _fpsBoxW - _fpsPadX, _fpsY + _fpsPadY);
+                        lyricsCtx.restore();
+                        stackPush('tr', _fpsBoxH);
+                    }
+
+                    // 2. Section HUD.
+                    if (sectionHudVisible && bundle.sections && bundle.sections.length) {
+                        const secH = drawSectionHud(lyricsCtx, {
+                            sections: bundle.sections,
+                            currentTime: bundle.currentTime,
+                            canvasW: lyricsCanvas.width, canvasH: lyricsCanvas.height,
+                            position: sectionHudPosition,
+                            sizeSlider: sectionHudSize,
+                            lyricsBottom,
+                            stackOffset: cornerStack[sectionHudPosition] || 0,
+                        });
+                        stackPush(sectionHudPosition, secH);
+                    }
+
+                    // 3. Tone HUD.
+                    if (toneHudVisible && (bundle.toneChanges?.length || bundle.toneBase)) {
+                        const toneH = drawToneHud(lyricsCtx, {
+                            toneChanges: bundle.toneChanges,
+                            toneBase: bundle.toneBase,
+                            currentTime: bundle.currentTime,
+                            canvasW: lyricsCanvas.width, canvasH: lyricsCanvas.height,
+                            position: toneHudPosition,
+                            sizeSlider: toneHudSize,
+                            lyricsBottom,
+                            stackOffset: cornerStack[toneHudPosition] || 0,
+                        });
+                        stackPush(toneHudPosition, toneH);
+                    }
+
+                    // 4. Chord diagram — always last (bottommost in the stack).
+                    // Draw outgoing first so the incoming diagram renders on top,
                     // making the entrance scale-in animation visible during crossfades.
-                    if (_diagPrev && _diagPrevOpacity > 0) {
+                    // The outgoing (prev) diagram uses the same corner slot — it is
+                    // fading out while the incoming one fades in, so they share the
+                    // same stack position and don't double-count the height.
+                    if (chordDiagramVisible && _diagPrev && _diagPrevOpacity > 0) {
                         _drawDiagramCached(lyricsCtx, {
                             name: _diagPrev.name, frets: _diagPrev.frets,
                             opacity: _diagPrevOpacity,
-                            // Derive entranceT live from _diagPrev.t so a backward seek within
-                            // the crossfade window rewinds the scale, not just the opacity.
                             entranceT: (_diagPrev.t !== undefined)
                                 ? Math.min(1.0, Math.max(0, (bundle.currentTime - _diagPrev.t) / DIAG_ENTRANCE_S))
                                 : 1.0,
@@ -10501,31 +11033,23 @@
                             sizeSlider: chordDiagramSize, position: chordDiagramPosition,
                             nStr: _diagPrev.nStr ?? nStr,
                             lyricsBottom,
+                            stackOffset: cornerStack[chordDiagramPosition] || 0,
                         });
+                        // Don't push here — outgoing and incoming share the same slot.
                     }
-                    if (_diagChord) {
-                        _drawDiagramCached(lyricsCtx, {
+                    if (chordDiagramVisible && _diagChord) {
+                        const diagH = _drawDiagramCached(lyricsCtx, {
                             name: _diagChord.name, frets: _diagChord.frets,
                             opacity: Math.max(0, 1 + (_diagChord.t - bundle.currentTime) / DIAG_LINGER_S),
                             entranceT: _diagEntranceT,
                             canvasW: lyricsCanvas.width, canvasH: lyricsCanvas.height,
                             inverted: _invertedCached,
                             sizeSlider: chordDiagramSize, position: chordDiagramPosition,
-                            // Use the string count captured when this chord was first seen so that
-                            // an arrangement switch mid-linger does not remap the overlay columns.
                             nStr: _diagChord.nStr ?? nStr,
                             lyricsBottom,
+                            stackOffset: cornerStack[chordDiagramPosition] || 0,
                         });
-                    }
-                    if (sectionHudVisible && bundle.sections && bundle.sections.length) {
-                        drawSectionHud(lyricsCtx, {
-                            sections: bundle.sections,
-                            currentTime: bundle.currentTime,
-                            canvasW: lyricsCanvas.width, canvasH: lyricsCanvas.height,
-                            position: sectionHudPosition,
-                            sizeSlider: sectionHudSize,
-                            lyricsBottom,
-                        });
+                        stackPush(chordDiagramPosition, diagH);
                     }
                 }
                 // Draw-hook compatibility: fire hooks registered via

@@ -14,14 +14,15 @@ const path = require('node:path');
 
 const SCREEN_JS = path.join(__dirname, '..', '..', 'plugins', 'highway_3d', 'screen.js');
 
-test('sustain rails are gated on multi-note, non-repeat chords within AHEAD', () => {
-    // Repeat frames in a chord sequence must not each draw their own rails,
-    // and single notes have no chord frame to anchor a rail to.
+test('sustain rails are gated on multi-note chords with a known box width within AHEAD', () => {
+    // Each chord in a sequence (including repeats) draws a rail from its onset
+    // to the next chord's onset, chaining together to cover the full handshape
+    // duration visually. Single notes have no chord frame to anchor a rail to.
     const src = fs.readFileSync(SCREEN_JS, 'utf8');
     assert.match(
         src,
-        /if\s*\(\s*chShape\.size\s*>\s*1\s*&&\s*chordOpenBoxW\s*!=\s*null\s*&&\s*!isRepeat\s*&&\s*chDt\s*<\s*AHEAD\s*\)/,
-        'sustain-rail block must stay gated on chShape.size > 1, chordOpenBoxW, !isRepeat and chDt < AHEAD',
+        /if\s*\(\s*chShape\.size\s*>\s*1\s*&&\s*chordOpenBoxW\s*!=\s*null\s*&&\s*chDt\s*<\s*AHEAD\s*\)/,
+        'sustain-rail block must stay gated on chShape.size > 1, chordOpenBoxW and chDt < AHEAD',
     );
 });
 
@@ -35,13 +36,13 @@ test('sustain rails pick arpeggio color for arpeggio frames, teal otherwise', ()
 });
 
 test('sustain-rail pool meshes keep renderOrder 16 so note gems (20/21) stay on top', () => {
-    // renderOrder 16 sits above the chord frame (12/13) but below note
-    // outline/core (20/21). Bumping it past the notes would let the rails
+    // renderOrder 11 sits above the chord frame edges but below note
+    // outline/core. Bumping it past the notes would let the rails
     // occlude flying gems.
     const src = fs.readFileSync(SCREEN_JS, 'utf8');
     assert.match(
         src,
-        /pSusRail\s*=\s*pool\([^)]*,\s*\(\)\s*=>\s*\{[\s\S]*?m\.renderOrder\s*=\s*16\s*;[\s\S]*?\}\s*\)/,
-        'pSusRail pool must seed meshes with renderOrder = 16',
+        /pSusRail\s*=\s*pool\([^)]*,\s*\(\)\s*=>\s*\{[\s\S]*?m\.renderOrder\s*=\s*11\s*;[\s\S]*?\}\s*\)/,
+        'pSusRail pool must seed meshes with renderOrder = 11',
     );
 });

@@ -852,6 +852,12 @@ def parse_arrangement(xml_path: str) -> Arrangement:
                 # when there are no <chordNote> children (gallop/repeat strums).
                 _ch_pm  = _bool(c, "palmMute")
                 _ch_mt  = _bool(c, "mute")
+                # fretHandMute at the chord level is the chord-wide form of the
+                # per-note fret-hand mute. Keep it on its own field
+                # (`fret_hand_mute`, wire key "fhm") instead of folding it into
+                # `mute` ("mt"): that preserves wire-format fidelity and matches
+                # `_parse_note`, which maps XML fretHandMute -> fret_hand_mute.
+                _ch_fhm = _bool(c, "fretHandMute")
                 _ch_acc = _bool(c, "accent")
                 if not chord_notes and cid < len(chord_templates):
                     ct = chord_templates[cid]
@@ -859,10 +865,12 @@ def parse_arrangement(xml_path: str) -> Arrangement:
                         if ct.frets[s] >= 0:
                             chord_notes.append(Note(
                                 time=t, string=s, fret=ct.frets[s],
-                                palm_mute=_ch_pm, mute=_ch_mt,
+                                palm_mute=_ch_pm,
+                                mute=_ch_mt,
+                                fret_hand_mute=_ch_fhm,
                                 accent=_ch_acc,
                             ))
-                elif chord_notes and (_ch_pm or _ch_mt or _ch_acc):
+                elif chord_notes and (_ch_pm or _ch_mt or _ch_fhm or _ch_acc):
                     # Propagate chord-level flags to chordNote children that
                     # don't set them explicitly. `_parse_note` flattens an
                     # absent attribute and an explicit false literal (`""`,
@@ -875,6 +883,8 @@ def parse_arrangement(xml_path: str) -> Arrangement:
                             cn.palm_mute = True
                         if _ch_mt and cn_elem.get("mute") is None:
                             cn.mute = True
+                        if _ch_fhm and cn_elem.get("fretHandMute") is None:
+                            cn.fret_hand_mute = True
                         if _ch_acc and cn_elem.get("accent") is None:
                             cn.accent = True
                 lv_chords.append(Chord(

@@ -2086,7 +2086,7 @@ function createHighway() {
     // bypass drawNote and so must fall back to the full path whenever a
     // technique flag is present, otherwise authored cues vanish silently.
     function _noteHasTechniqueFlags(n) {
-        if (n.bn || n.ho || n.po || n.tp || n.pm || n.vb || n.tr || n.ac || n.hm || n.hp || n.mt) return true;
+        if (n.bn || n.ho || n.po || n.tp || n.pm || n.vb || n.tr || n.ac || n.hm || n.hp || n.mt || n.fhm) return true;
         if (typeof n.sl === 'number' && n.sl >= 0) return true;
         return false;
     }
@@ -2193,7 +2193,7 @@ function createHighway() {
             let allMuted = sortedNotes.length > 0;
             if (allMuted) {
                 for (let j = 0; j < sortedNotes.length; j++) {
-                    if (!sortedNotes[j].mt) { allMuted = false; break; }
+                    if (!(sortedNotes[j].mt || sortedNotes[j].fhm)) { allMuted = false; break; }
                 }
             }
             info.allMuted = allMuted;

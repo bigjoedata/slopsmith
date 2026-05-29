@@ -541,6 +541,351 @@ def list_tracks(gp_path: str) -> list[dict]:
 # Converts GPX tracks directly to Rocksmith XML, reusing gp2rs._build_xml
 # ---------------------------------------------------------------------------
 
+
+
+def _find_piano_pairs(
+    track_indices: list[int],
+    tracks: list[dict],
+    names: dict[int, str],
+) -> tuple[list[int], dict[int, int]]:
+    """
+    Detect Piano LH/RH track pairs and return a merge map.
+
+    Guitar Pro 6 models piano tracks on guitar/bass string templates (no native
+    keyboard type). A typical GPX piano part has two tracks — e.g. "Piano RH"
+    (7-string guitar, treble range) and "Piano LH" (5-string bass, bass range).
+    Importing them separately gives two Keys arrangements shown one at a time.
+    Merging them gives a single full-width Synthesia-style chart in the piano
+    highway, with both hands falling onto the correct keys simultaneously.
+
+    Detection: among the keys tracks being imported, find pairs where both share
+    a common stem and one name ends in 'rh' and the other in 'lh'
+    (case-insensitive, word-boundary matched).
+
+    Returns:
+        filtered_indices — track_indices with LH tracks removed (consumed by merge)
+        merge_map        — {rh_track_idx: lh_track_idx}
+    """
+    keys_tracks = [
+        i for i in track_indices
+        if 0 <= i < len(tracks)
+        and (
+            any(kw in tracks[i]['name'].lower()
+                for kw in ('piano', 'keys', 'keyboard'))
+            or names.get(i, '').lower().startswith('keys')
+        )
+    ]
+
+    merge_map: dict[int, int] = {}
+    consumed: set[int] = set()
+
+    for i in keys_tracks:
+        if i in consumed:
+            continue
+        low_i = tracks[i]['name'].strip().lower()
+        if not re.search(r'\brh\b', low_i):
+            continue
+        stem = re.sub(r'\s*\brh\b\s*$', '', low_i).strip()
+        for j in keys_tracks:
+            if j == i or j in consumed:
+                continue
+            low_j = tracks[j]['name'].strip().lower()
+            if not re.search(r'\blh\b', low_j):
+                continue
+            stem_j = re.sub(r'\s*\blh\b\s*$', '', low_j).strip()
+            if stem_j == stem:
+                merge_map[i] = j
+                consumed.add(j)
+                break
+
+    filtered = [i for i in track_indices if i not in consumed]
+    return filtered, merge_map
+
+
+
+def _collect_tone_events(
+    raw_idx: int,
+    masterbars: list,
+    bars_by_id: dict,
+    voices_dict: dict,
+    beats_dict: dict,
+    rhythms_dict: dict,
+    tempo_map: list,
+    audio_offset: float,
+    *,
+    tempo_bpm: float = 120.0,
+) -> list[tuple[float, str]]:
+    """
+    Extract tone change events for one track from its beat-level <Bank> elements.
+
+    Guitar Pro 6 stores the active RSE sound preset name as a <Bank> child on
+    the first beat of any bar where the sound is set or changes. We deduplicate
+    consecutive identical names so only genuine transitions are emitted.
+
+    Returns a list of (time_secs, bank_name) pairs, sorted by time, with
+    audio_offset applied. Empty list if the track has no Bank elements.
+    """
+    current_time = 0.0
+    events: list[tuple[float, str]] = []
+
+    tempo_iter = iter(tempo_map)
+    next_tempo_bar, next_tempo_bpm = next(tempo_iter, (999999, 120.0))
+    # Start at the song's base tempo (same as convert_file's note builder); the
+    # per-bar loop applies each tempo change once its bar index is reached.
+    # Seeding from tempo_map[0] would wrongly apply a first tempo event that
+    # begins at a later bar to the bars before it, and hardcoding 120 would
+    # drift tone timestamps off the note timeline when the base tempo isn't 120.
+    cur_tempo = tempo_bpm
+
+    for mb_idx, mb in enumerate(masterbars):
+        # Advance tempo
+        while mb_idx >= next_tempo_bar:
+            cur_tempo = next_tempo_bpm
+            next_tempo_bar, next_tempo_bpm = next(tempo_iter, (999999, cur_tempo))
+
+        time_sig = mb.findtext('Time', '4/4')
+        try:
+            num_b, den_b = [int(x) for x in time_sig.split('/')]
+        except ValueError:
+            num_b, den_b = 4, 4
+        bar_duration = num_b * (4.0 / den_b) * (60.0 / cur_tempo)
+
+        bar_ids = mb.findtext('Bars', '').split()
+        bid = bar_ids[raw_idx] if raw_idx < len(bar_ids) else '-1'
+
+        if bid != '-1' and bid:
+            bar = bars_by_id.get(bid)
+            if bar is not None:
+                for vid in bar.findtext('Voices', '').split():
+                    if vid == '-1':
+                        continue
+                    voice = voices_dict.get(vid)
+                    if voice is None:
+                        continue
+                    voice_time = current_time
+                    for beat_id in voice.findtext('Beats', '').split():
+                        beat_el = beats_dict.get(beat_id)
+                        if beat_el is None:
+                            continue
+                        dur = _beat_dur_secs(beat_el, rhythms_dict, cur_tempo)
+                        bank = (beat_el.findtext('Bank') or '').strip()
+                        if bank:
+                            events.append((round(voice_time + audio_offset, 3), bank))
+                        voice_time += dur
+
+        current_time += bar_duration
+
+    # Sort by time first, THEN drop consecutive duplicates. Multi-voice bars
+    # reset voice_time per voice so traversal order isn't chronological;
+    # deduping during traversal could drop an earlier-in-time tone change in a
+    # later-traversed voice. Collapsing only after sorting keeps the earliest
+    # change for each transition.
+    events.sort(key=lambda e: e[0])
+    deduped: list[tuple[float, str]] = []
+    for ev in events:
+        if not deduped or ev[1] != deduped[-1][1]:
+            deduped.append(ev)
+    return deduped
+
+
+
+def _inject_tones(xml_str: str, tone_events: list[tuple[float, str]]) -> str:
+    """
+    Inject a <tones> element into a Rocksmith arrangement XML string.
+
+    Parses the prettified XML returned by _build_xml, inserts the tones
+    block before </song>, and re-serialises. Noop if tone_events is empty.
+
+    Each entry in tone_events is (time_secs, name). Consecutive duplicates
+    are already removed by _collect_tone_events; here we assign sequential
+    integer IDs as required by the RS schema.
+    """
+    if not tone_events:
+        return xml_str
+
+    import xml.etree.ElementTree as _ET
+    from xml.dom import minidom as _minidom
+
+    try:
+        root = _ET.fromstring(xml_str)
+    except _ET.ParseError:
+        return xml_str  # don't corrupt XML on parse failure
+
+    # Record the initial tone as <tonebase> (unless one already exists) so tone
+    # extraction (lib/tones.py::_xml_tone_changes) and loose-XML playback know
+    # the base tone instead of leaving it empty.
+    _base_el = root.find('tonebase')
+    if _base_el is None:
+        _ET.SubElement(root, 'tonebase').text = tone_events[0][1]
+    elif not (_base_el.text or '').strip():
+        # Populate an empty/whitespace <tonebase> too — leaving it blank would
+        # defeat the point of recording the base tone. A non-empty existing
+        # base is preserved.
+        _base_el.text = tone_events[0][1]
+
+    # Replace ALL pre-existing <tones> blocks rather than appending another
+    # (idempotent if this is somehow called twice, or the source XML already
+    # carried one or more) — duplicate <tones> sections break tone parsing.
+    for existing_tones in root.findall('tones'):
+        root.remove(existing_tones)
+
+    tones_el = _ET.SubElement(root, 'tones', count=str(len(tone_events)))
+    for i, (t, name) in enumerate(tone_events):
+        _ET.SubElement(tones_el, 'tone',
+                       id=str(i),
+                       name=name,
+                       time=f'{t:.3f}')
+
+    # _build_xml already pretty-printed the input, so parsing it leaves the
+    # indentation as whitespace-only text/tail nodes. Drop those before the
+    # second pretty-print, otherwise minidom preserves them and stacks fresh
+    # indentation on top, exploding the output with blank lines.
+    def _strip_ws(el: _ET.Element) -> None:
+        if el.text is not None and not el.text.strip():
+            el.text = None
+        if el.tail is not None and not el.tail.strip():
+            el.tail = None
+        for child in el:
+            _strip_ws(child)
+
+    _strip_ws(root)
+    raw = _ET.tostring(root, encoding='unicode')
+    dom = _minidom.parseString(raw)
+    return dom.toprettyxml(indent='  ', encoding=None)
+
+
+
+def convert_vocal_track_to_pitch_sidecar(
+    root: ET.Element,
+    track: dict,
+    raw_idx: int,
+    masterbars: list,
+    bars_by_id: dict,
+    voices_dict: dict,
+    beats_dict: dict,
+    notes_dict: dict,
+    rhythms_dict: dict,
+    *,
+    tempo_bpm: float = 120.0,
+    audio_offset: float = 0.0,
+) -> dict:
+    """
+    Extract per-syllable pitch from a GPX vocal track as a vocal_pitch.json dict.
+
+    Returns the same payload shape as the lyrics-karaoke plugin's
+    ``_persist_pitch`` function so GPX vocal pitch can be written directly
+    into a sloppak alongside lyrics.json:
+
+        {"version": 1, "notes": [{"t": float, "d": float, "midi": int}, ...]}
+
+    This is complementary to convert_vocal_track() which produces RS XML.
+    NOTE: nothing in this module calls this helper yet — convert_file() does not
+    invoke it, so no vocal_pitch.json is emitted automatically. A caller wanting
+    the pitch ribbon must call this itself and persist the returned dict (e.g.
+    write it as vocal_pitch.json into the sloppak). When wiring vocals into a
+    sloppak, call both:
+        - convert_vocal_track() → vocals arrangement XML (karaoke highway)
+        - convert_vocal_track_to_pitch_sidecar() → vocal_pitch.json (pitch ribbon)
+
+    Pitch source is the tab author's authored notes (exact), not AI audio
+    analysis — so this is more accurate than pYIN/CREPE for well-authored tabs.
+    """
+    string_pitches = track['string_pitches']
+    notes: list[dict] = []
+    current_time = 0.0
+
+    # Per-bar tempo from map. _build_tempo_map() returns a synthetic [(0, 120)]
+    # when the file has no explicit tempo automations — in that case honour the
+    # caller-supplied tempo_bpm fallback instead of silently forcing 120 BPM.
+    _mt = root.find('MasterTrack')
+    _has_explicit_tempo = _mt is not None and any(
+        a.findtext('Type') == 'Tempo' for a in _mt.findall('.//Automations/*')
+    )
+    _tp = _build_tempo_map(root) if _has_explicit_tempo else [(0, tempo_bpm)]
+    _tp_iter = iter(_tp)
+    _next_bar, _next_bpm = next(_tp_iter, (999999, tempo_bpm))
+    _cur_tempo = tempo_bpm
+
+    for mb_idx, mb in enumerate(masterbars):
+        while mb_idx >= _next_bar:
+            _cur_tempo = _next_bpm
+            _next_bar, _next_bpm = next(_tp_iter, (999999, _cur_tempo))
+
+        time_sig = mb.findtext('Time', '4/4')
+        try:
+            num_b, den_b = [int(x) for x in time_sig.split('/')]
+        except ValueError:
+            num_b, den_b = 4, 4
+        bar_duration = num_b * (4.0 / den_b) * (60.0 / _cur_tempo)
+
+        bar_ids = mb.findtext('Bars', '').split()
+        bid = bar_ids[raw_idx] if raw_idx < len(bar_ids) else '-1'
+
+        if bid != '-1' and bid:
+            bar = bars_by_id.get(bid)
+            if bar is not None:
+                for vid in bar.findtext('Voices', '').split():
+                    if vid == '-1':
+                        continue
+                    voice = voices_dict.get(vid)
+                    if voice is None:
+                        continue
+                    voice_time = current_time
+                    for beat_id in voice.findtext('Beats', '').split():
+                        beat_el = beats_dict.get(beat_id)
+                        if beat_el is None:
+                            continue
+                        dur = _beat_dur_secs(beat_el, rhythms_dict, _cur_tempo)
+
+                        # Only emit notes that have a lyric — unvoiced beats
+                        # (rests, instrumental fills) are excluded so the
+                        # pitch ribbon stays aligned with lyric tokens.
+                        lyric_el = beat_el.find('Lyrics')
+                        has_lyric = (
+                            lyric_el is not None
+                            and lyric_el.find('Line') is not None
+                            and (lyric_el.find('Line').text or '').strip()
+                        )
+                        if not has_lyric:
+                            voice_time += dur
+                            continue
+
+                        notes_text = beat_el.findtext('Notes', '').strip()
+                        for nid in notes_text.split():
+                            note_el = notes_dict.get(nid)
+                            if note_el is None:
+                                continue
+                            if _note_is_tie(note_el):
+                                # Extend previous note's duration
+                                if notes:
+                                    notes[-1]['d'] = round(
+                                        max(notes[-1]['d'],
+                                            (voice_time + audio_offset + dur) - notes[-1]['t']),
+                                        3,
+                                    )
+                                continue
+                            midi = _note_midi(note_el, string_pitches)
+                            if midi is None:
+                                continue
+                            notes.append({
+                                't': round(voice_time + audio_offset, 3),
+                                'd': round(dur, 3),
+                                'midi': midi,
+                            })
+                            break  # one pitch per vocal beat
+
+                        voice_time += dur
+
+        current_time += bar_duration
+
+    # Sort chronologically: multi-voice bars reset voice_time per voice, so
+    # traversal order isn't time-ordered. A time-series JSON should be sorted by
+    # onset for deterministic output and consumers that assume chronology.
+    notes.sort(key=lambda n: n['t'])
+    return {'version': 1, 'notes': notes}
+
+
+
 def convert_file(
     gp_path: str,
     output_dir: str,
@@ -614,6 +959,10 @@ def convert_file(
         filtered_to_raw[filtered_pos] = raw_idx
         filtered_pos += 1
 
+
+    # Detect and merge Piano LH+RH pairs into single full-keyboard arrangements
+    track_indices, _piano_merge_map = _find_piano_pairs(track_indices, tracks, names)
+
     output_files = []
 
     for track_idx in track_indices:
@@ -626,12 +975,20 @@ def convert_file(
         # Decide conversion mode
         is_drum = track['is_drums'] or (arr_name.lower().startswith('drums'))
         is_vocal = _is_vocal_track(track) or arr_name.lower().startswith('vocal')
+        # GP6 models piano/keys parts on guitar/bass string templates, so a
+        # named keyboard track usually HAS string_pitches. Gate only the
+        # midi_program heuristic on `not string_pitches` (to avoid grabbing real
+        # guitars); a name/arrangement keyword forces keys regardless, so these
+        # tracks take the keys encoding and the LH/RH merge map actually applies.
         is_keys = (
-            not is_drum and not is_vocal and not track['string_pitches']
+            not is_drum and not is_vocal
             and (
-                track['midi_program'] in set(range(0, 8)) | set(range(16, 24)) | {80, 81, 82, 83}
-                or any(kw in track['name'].lower() for kw in ('piano', 'keys', 'organ'))
+                any(kw in track['name'].lower() for kw in ('piano', 'keys', 'keyboard', 'organ'))
                 or arr_name.lower().startswith('keys')
+                or (
+                    not track['string_pitches']
+                    and track['midi_program'] in set(range(0, 8)) | set(range(16, 24)) | {80, 81, 82, 83}
+                )
             )
         )
 
@@ -889,6 +1246,122 @@ def convert_file(
         else:
             tuning = _gpx_tuning(track)
 
+        # Merge Piano LH notes into this (RH) arrangement if a pair was detected
+        if is_keys and track_idx in _piano_merge_map:
+            lh_idx = _piano_merge_map[track_idx]
+            lh_track = tracks[lh_idx]
+            lh_raw_idx = filtered_to_raw.get(lh_idx, lh_idx)
+
+            _lh_notes: list[RsNote] = []
+            _lh_last_per_key: dict[int, RsNote] = {}
+            _lh_tempo_iter = iter(tempo_map)
+            _lh_next_bar, _lh_next_bpm = next(_lh_tempo_iter, (999999, tempo_bpm))
+            _lh_cur_tempo = tempo_bpm
+            _lh_time = 0.0
+
+            for _lh_mb_idx, _lh_mb in enumerate(masterbars):
+                while _lh_mb_idx >= _lh_next_bar:
+                    _lh_cur_tempo = _lh_next_bpm
+                    _lh_next_bar, _lh_next_bpm = next(_lh_tempo_iter, (999999, _lh_cur_tempo))
+                _lh_ts = _lh_mb.findtext('Time', '4/4')
+                try:
+                    _lh_nb, _lh_db = [int(x) for x in _lh_ts.split('/')]
+                except ValueError:
+                    _lh_nb, _lh_db = 4, 4
+                _lh_bar_dur = _lh_nb * (4.0 / _lh_db) * (60.0 / _lh_cur_tempo)
+                _lh_bar_ids = _lh_mb.findtext('Bars', '').split()
+                _lh_bid = _lh_bar_ids[lh_raw_idx] if lh_raw_idx < len(_lh_bar_ids) else '-1'
+                if _lh_bid != '-1' and _lh_bid:
+                    _lh_bar = bars_by_id.get(_lh_bid)
+                    if _lh_bar is not None:
+                        for _lh_vid in _lh_bar.findtext('Voices', '').split():
+                            if _lh_vid == '-1':
+                                continue
+                            _lh_voice = voices_dict.get(_lh_vid)
+                            if _lh_voice is None:
+                                continue
+                            _lh_vt = _lh_time
+                            for _lh_beat_id in _lh_voice.findtext('Beats', '').split():
+                                _lh_beat = beats_dict.get(_lh_beat_id)
+                                if _lh_beat is None:
+                                    continue
+                                _lh_dur = _beat_dur_secs(_lh_beat, rhythms_dict, _lh_cur_tempo)
+                                for _lh_nid in _lh_beat.findtext('Notes', '').strip().split():
+                                    _lh_note_el = notes_dict.get(_lh_nid)
+                                    if _lh_note_el is None:
+                                        continue
+                                    if _note_is_tie(_lh_note_el):
+                                        # Extend the matching prior note (same
+                                        # pitch), mirroring the main builder's
+                                        # last_note_per_key handling — blindly
+                                        # extending the last-emitted note
+                                        # mishandles polyphonic (chord) LH parts.
+                                        _tie_midi = _note_midi(_lh_note_el, lh_track['string_pitches'])
+                                        if _tie_midi is not None:
+                                            _prev = _lh_last_per_key.get(_tie_midi)
+                                            # Full-precision comparison (matching
+                                            # the main builder); rounding only
+                                            # happens at XML serialization. Rounding
+                                            # here could make a short note appear to
+                                            # start at the tie time and skip the
+                                            # sustain extension.
+                                            _tie_t = _lh_vt + audio_offset
+                                            if _prev is not None and _prev.time < _tie_t:
+                                                _prev.sustain = max(
+                                                    _prev.sustain,
+                                                    (_tie_t + _lh_dur) - _prev.time,
+                                                )
+                                        continue
+                                    _lh_midi = _note_midi(_lh_note_el, lh_track['string_pitches'])
+                                    if _lh_midi is None:
+                                        continue
+                                    # Keep full-precision time (like the main
+                                    # convert_file() builder — rounding happens at
+                                    # serialization); same 0.2s sustain threshold.
+                                    _lh_rn = RsNote(
+                                        time=_lh_vt + audio_offset,
+                                        string=_lh_midi // 24,
+                                        fret=_lh_midi % 24,
+                                        sustain=_lh_dur if _lh_dur > 0.2 else 0.0,
+                                    )
+                                    _lh_notes.append(_lh_rn)
+                                    _lh_last_per_key[_lh_midi] = _lh_rn
+                                _lh_vt += _lh_dur
+                _lh_time += _lh_bar_dur
+
+            # Merge: combine and deduplicate simultaneous same-pitch notes, then
+            # sort by time. Map each (time, string, fret) to its existing RsNote
+            # so that when both hands hit the same key at the same instant we
+            # keep the LONGER sustain instead of arbitrarily discarding the LH
+            # one. Seed from both single notes and chord notes — polyphonic RH
+            # beats live in rs_chords[*].notes, so seeding from rs_notes alone
+            # would let an identical LH note slip in as a duplicate.
+            _seen: dict[tuple, RsNote] = {}
+            for _n in rs_notes:
+                _seen.setdefault((round(_n.time, 3), _n.string, _n.fret), _n)
+            for _c in rs_chords:
+                for _cn in _c.notes:
+                    _seen.setdefault((round(_cn.time, 3), _cn.string, _cn.fret), _cn)
+            for _lh_rn in _lh_notes:
+                _k = (round(_lh_rn.time, 3), _lh_rn.string, _lh_rn.fret)
+                _existing = _seen.get(_k)
+                if _existing is None:
+                    rs_notes.append(_lh_rn)
+                    _seen[_k] = _lh_rn
+                elif _lh_rn.sustain > _existing.sustain:
+                    # Same key both hands — preserve the longer sustain (mutating
+                    # the RsNote also updates it in place inside any RH chord).
+                    _existing.sustain = _lh_rn.sustain
+            rs_notes.sort(key=lambda n: (n.time, n.string))
+
+            # Collapse "Keys 2" -> "Keys": the merged LH+RH is a single
+            # keyboard arrangement. Keep the standard "Keys" name (not "Piano")
+            # so downstream arrangement matching/filtering and the piano-highway
+            # auto-select (which keys on arr_name.startswith("keys")) still work.
+            arr_name = re.sub(r'\s*\d+$', '', arr_name).strip() or 'Keys'
+
+        # Build the arrangement XML *after* the optional piano merge so the
+        # merged LH notes and the renamed arrangement actually reach the output.
         xml_str = _build_xml(
             title=title or 'Untitled',
             artist=artist or 'Unknown',
@@ -907,6 +1380,16 @@ def convert_file(
             anchors=anchors,
             tempo=int(tempo_bpm),
         )
+
+        # Inject tone change markers for guitar/bass tracks
+        if not is_drum and not is_keys and not is_vocal and track['string_pitches']:
+            tone_events = _collect_tone_events(
+                raw_idx, masterbars, bars_by_id, voices_dict,
+                beats_dict, rhythms_dict, tempo_map, audio_offset,
+                tempo_bpm=tempo_bpm,
+            )
+            if tone_events:
+                xml_str = _inject_tones(xml_str, tone_events)
 
         filename = f"{_safe_filename_stem(track['name'])}_{arr_name or 'arr'}.xml"
         filepath = safe_join(out, filename)

@@ -1,0 +1,1077 @@
+"""
+lib/gp_autosync.py — Automatic score-to-audio alignment for Guitar Pro files.
+
+Aligns a Guitar Pro tab to an audio file using chroma-based Dynamic Time
+Warping (DTW), producing a GpSyncData object compatible with gp8_audio_sync.
+This allows any GP file (GP3-GP8) to be precisely aligned to a matching
+audio recording without manual sync point placement.
+
+The approach:
+1. Synthesise a chroma feature matrix from the tab's note pitches and timing
+2. Extract a chroma feature matrix from the audio file using librosa
+3. Align them with DTW to find the optimal bar-to-timestamp mapping
+4. Return a GpSyncData with sync points sampled at bar boundaries
+
+Dependencies: librosa, numpy, soundfile (all present when lyrics-karaoke
+plugin is installed; graceful ImportError otherwise with clear message).
+
+Public API:
+    is_available()                          -> bool
+    auto_sync(gp_path, audio_path, ...)    -> GpSyncData
+    estimate_audio_offset(gp_path,
+                          audio_path)      -> float
+"""
+
+from __future__ import annotations
+
+import logging
+import xml.etree.ElementTree as ET
+import zipfile
+import io
+from pathlib import Path
+
+_log = logging.getLogger("slopsmith.lib.gp_autosync")
+
+# ── Dependency check ──────────────────────────────────────────────────────────
+
+def is_available() -> bool:
+    """Return True if librosa and numpy are importable.
+
+    auto_sync() requires librosa. When the lyrics-karaoke plugin is installed
+    librosa is already present. Without it, auto_sync raises ImportError with
+    a clear installation message rather than crashing at import time.
+    """
+    try:
+        import librosa  # noqa: F401
+        import numpy    # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+# ── Re-use GpSyncData from gp8_audio_sync ────────────────────────────────────
+
+from gp8_audio_sync import GpSyncData, SyncPoint
+
+def _parse_gpif_bytes(data: bytes) -> 'ET.Element':
+    """Parse GPIF XML bytes using defusedxml when available, stdlib otherwise.
+
+    defusedxml prevents XML attacks (XXE, billion laughs) from maliciously
+    crafted GP files. Falls back to stdlib with a warning if not installed.
+    """
+    try:
+        import defusedxml.ElementTree as _dxml
+        return _dxml.fromstring(data)
+    except ImportError:
+        _log.warning(
+            'gp_autosync: defusedxml not installed; '
+            'parsing GPIF with stdlib xml.etree (install defusedxml for hardened parsing)'
+        )
+        return ET.fromstring(data)
+
+
+class _Gp345FileError(ValueError):
+    """Raised by _load_gpif when the file is a GP3/GP4/GP5 binary (not GPIF XML).
+    Caught by auto_sync() to route to the PyGuitarPro-based chroma path."""
+    pass
+
+# ── Internal constants ────────────────────────────────────────────────────────
+
+# Sample rate for chroma analysis. 22050 Hz matches the lyrics-karaoke plugin
+# and is standard for librosa. Audio is resampled on load; the GP file's
+# original sample rate is irrelevant here.
+_SR = 22050
+
+# Hop length for DTW-level chroma. Larger hop = fewer frames = faster DTW
+# but coarser resolution. At hop=4096, sr=22050: ~186ms per frame, which
+# gives bar-level accuracy (a 4/4 bar at 80 BPM is 3000ms = ~16 frames).
+# Memory: (song_frames)^2 * 8 bytes. A 10-minute song at hop=4096 gives
+# ~3200 frames -> ~82MB. Acceptable on any modern system.
+_HOP_DTW = 4096
+
+# Diatonic step -> semitone offset (for Tone+Octave encoded notes in GPX)
+_STEP_TO_SEMI = [0, 2, 4, 5, 7, 9, 11]  # C D E F G A B
+
+# Note value string -> quarter-note duration multiplier
+_NOTE_VALUE_QN = {
+    'Whole': 4.0, 'Half': 2.0, 'Quarter': 1.0, 'Eighth': 0.5,
+    '16th': 0.25, '32nd': 0.125, '64th': 0.0625, '128th': 0.03125,
+}
+
+# Minimum number of sync points to sample from the DTW path.
+# More points = better accuracy across tempo changes.
+_MIN_SYNC_POINTS = 8
+
+# Skip tracks matching these name keywords — they don't contribute
+# musically meaningful chroma (drums have no pitch, vocals drift in Hz).
+_SKIP_TRACK_KEYWORDS = frozenset({
+    'vocal', 'voice', 'vox', 'sing', 'drum', 'percussion', 'perc',
+    'click', 'metronome',
+})
+
+# ── GPIF loading (mirrors gp2rs_gpx._load_gpif) ──────────────────────────────
+
+def _load_gpif(gp_path: str) -> ET.Element:
+    """Load score.gpif from a .gpx (GP6) or .gp (GP7/GP8) file."""
+    with open(gp_path, 'rb') as fh:
+        raw = fh.read()
+
+    if raw[:2] == b'PK':  # GP7/GP8: ZIP container
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            if 'Content/score.gpif' not in zf.namelist():
+                raise ValueError("Content/score.gpif not found in GP7/GP8 container")
+            return _parse_gpif_bytes(zf.read('Content/score.gpif'))
+
+    if raw[:4] == b'BCFZ':  # GP6: BCFZ compressed
+        from gp2rs_gpx import _decompress_bcfz, _parse_bcfs
+        bcfs = _decompress_bcfz(raw)
+        fs = _parse_bcfs(bcfs)
+        return _parse_gpif_bytes(fs['score.gpif'])
+
+    if raw[:4] == b'BCFS':  # GP6: raw BCFS
+        from gp2rs_gpx import _parse_bcfs
+        fs = _parse_bcfs(raw)
+        return _parse_gpif_bytes(fs['score.gpif'])
+
+    # GP3/GP4/GP5: proprietary binary format — not GPIF XML.
+    # Raise a specific error so auto_sync() can route to the PyGuitarPro path.
+    raise _Gp345FileError(f"GP3/GP4/GP5 binary format (magic: {raw[:4]!r})")
+
+# ── Tempo extraction ──────────────────────────────────────────────────────────
+
+def _children(parent: ET.Element, tag: str) -> list:
+    """Return the children of ``parent/<tag>``, or ``[]`` when it's absent.
+
+    Avoids the ``parent.find(tag) or []`` idiom — testing an Element's truth
+    value is deprecated (an empty element is currently falsy but becomes
+    truthy in future Python), and would silently skip an empty container.
+    """
+    el = parent.find(tag)
+    return list(el) if el is not None else []
+
+
+def _get_initial_tempo(root: ET.Element) -> float:
+    """Return the first tempo value from MasterTrack automations."""
+    mt = root.find('MasterTrack')
+    if mt is not None:
+        for auto in mt.findall('.//Automations/*'):
+            if auto.findtext('Type') == 'Tempo':
+                raw = (auto.findtext('Value') or '').strip()
+                try:
+                    return float(raw.split()[0])
+                except (ValueError, IndexError):
+                    pass
+    return 120.0
+
+def _get_tempo_map(root: ET.Element) -> list[tuple[int, float]]:
+    """Return [(bar_index, bpm), ...] sorted by bar_index."""
+    events: list[tuple[int, float]] = []
+    mt = root.find('MasterTrack')
+    if mt is not None:
+        for auto in mt.findall('.//Automations/*'):
+            if auto.findtext('Type') == 'Tempo':
+                try:
+                    bar = int(auto.findtext('Bar') or 0)
+                    raw = (auto.findtext('Value') or '').strip()
+                    bpm = float(raw.split()[0])
+                    events.append((bar, bpm))
+                except (ValueError, IndexError):
+                    pass
+    events.sort(key=lambda e: e[0])
+    if not events:
+        events = [(0, 120.0)]
+    return events
+
+# ── Score chroma synthesis ────────────────────────────────────────────────────
+
+def _synthesise_score_chroma(
+    root: ET.Element,
+    n_frames: int,
+    sr: int,
+    hop: int,
+) -> 'np.ndarray':
+    """
+    Build a (12, n_frames) chroma matrix from all pitched tracks in the GPIF.
+
+    Each note contributes energy to its pitch class (MIDI % 12) across the
+    frames that span its duration. Tracks are filtered to exclude drums and
+    vocals, which don't contribute pitched chroma.
+
+    Handles three GPX note encodings:
+    - String+Fret with string pitches (guitar/bass)
+    - Tone+Octave (piano/melodic in GPX)
+    - Element+Variation (drums — skipped)
+    """
+    import numpy as np
+
+    tempo_map = _get_tempo_map(root)
+
+    masterbars = _children(root, 'MasterBars')
+    raw_tracks = _children(root, 'Tracks')
+    bars_by_id = {b.get('id'): b for b in _children(root, 'Bars')}
+    voices_dict = {v.get('id'): v for v in _children(root, 'Voices')}
+    beats_dict = {b.get('id'): b for b in _children(root, 'Beats')}
+    notes_dict = {n.get('id'): n for n in _children(root, 'Notes')}
+    rhythms_dict = {r.get('id'): r for r in _children(root, 'Rhythms')}
+
+    chroma = np.zeros((12, n_frames), dtype=np.float32)
+
+    for raw_idx, track_el in enumerate(raw_tracks):
+        name = (track_el.findtext('Name') or '').strip().lower()
+        if any(kw in name for kw in _SKIP_TRACK_KEYWORDS):
+            continue
+
+        # Skip drum tracks (GeneralMidi table=Percussion or channel 9)
+        gm = track_el.find('GeneralMidi')
+        if gm is not None:
+            if gm.get('table') == 'Percussion':
+                continue
+            try:
+                if int(gm.findtext('PrimaryChannel') or 0) == 9:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        inst_set = track_el.find('InstrumentSet')
+        if inst_set is not None:
+            if (inst_set.findtext('Type') or '').lower() == 'drumkit':
+                continue
+
+        # Get string pitches. GPIF Tuning/Pitches is stored high→low
+        # (index 0 = highest string) — the same ordering gp2rs_gpx._note_midi
+        # and _gpx_tuning rely on.
+        string_pitches: list[int] = []
+        for prop in track_el.findall('.//Property'):
+            if prop.get('name') == 'Tuning':
+                pe = prop.find('Pitches')
+                if pe is not None and pe.text:
+                    try:
+                        string_pitches = [int(p) for p in pe.text.split()]
+                    except ValueError:
+                        pass
+
+        # Walk the bar/voice/beat/note graph for this track
+        tempo_iter2 = iter(tempo_map)
+        next_tb, next_bpm = next(tempo_iter2, (999999, tempo_map[0][1]))
+        ct = tempo_map[0][1]
+        t_cur = 0.0
+
+        for mb_idx, mb in enumerate(masterbars):
+            while mb_idx >= next_tb:
+                ct = next_bpm
+                next_tb, next_bpm = next(tempo_iter2, (999999, ct))
+
+            ts = mb.findtext('Time', '4/4')
+            try:
+                n_b, d_b = [int(x) for x in ts.split('/')]
+            except ValueError:
+                n_b, d_b = 4, 4
+            bar_dur = n_b * (4.0 / d_b) * (60.0 / ct)
+
+            bar_ids = mb.findtext('Bars', '').split()
+            bid = bar_ids[raw_idx] if raw_idx < len(bar_ids) else '-1'
+
+            if bid != '-1' and bid:
+                bar = bars_by_id.get(bid)
+                if bar is not None:
+                    for vid in bar.findtext('Voices', '').split():
+                        if vid == '-1':
+                            continue
+                        voice = voices_dict.get(vid)
+                        if voice is None:
+                            continue
+                        vt = t_cur
+                        for beat_id in voice.findtext('Beats', '').split():
+                            beat = beats_dict.get(beat_id)
+                            if beat is None:
+                                continue
+                            rref = beat.find('Rhythm')
+                            dur_qn = 0.25
+                            if rref is not None:
+                                r = rhythms_dict.get(rref.get('ref', ''))
+                                if r is not None:
+                                    nv = r.findtext('NoteValue', 'Quarter')
+                                    dur_qn = _NOTE_VALUE_QN.get(nv, 0.25)
+                                    if r.find('AugmentationDot') is not None:
+                                        dur_qn *= 1.5
+                            dur = dur_qn * (60.0 / ct)
+
+                            for nid in beat.findtext('Notes', '').strip().split():
+                                note_el = notes_dict.get(nid)
+                                if note_el is None:
+                                    continue
+                                props = {
+                                    p.get('name'): p
+                                    for p in note_el.findall('.//Property')
+                                }
+                                midi: int | None = None
+
+                                # Skip drums (Element+Variation encoding)
+                                if 'Element' in props:
+                                    continue
+
+                                # String+Fret (guitar/bass)
+                                if 'String' in props and 'Fret' in props and string_pitches:
+                                    try:
+                                        str_idx = int(
+                                            props['String'].findtext('String') or 0
+                                        )
+                                        fret = int(
+                                            props['Fret'].findtext('Fret') or 0
+                                        )
+                                        # GP6 String index 0 = highest string,
+                                        # and string_pitches is high→low (index
+                                        # 0 = highest), so index directly — no
+                                        # reverse (matches gp2rs_gpx._note_midi).
+                                        if 0 <= str_idx < len(string_pitches):
+                                            midi = string_pitches[str_idx] + fret
+                                    except (ValueError, TypeError):
+                                        pass
+
+                                # Tone+Octave (piano/melodic)
+                                elif 'Tone' in props and 'Octave' in props:
+                                    try:
+                                        step = int(
+                                            props['Tone'].findtext('Step') or 0
+                                        )
+                                        octave = int(
+                                            props['Octave'].findtext('Number') or 4
+                                        )
+                                        midi = (octave + 1) * 12 + _STEP_TO_SEMI[step % 7]
+                                    except (ValueError, TypeError, IndexError):
+                                        pass
+
+                                if midi is not None:
+                                    chroma_bin = midi % 12
+                                    f0 = max(0, min(int(vt * sr / hop), n_frames - 1))
+                                    f1 = max(0, min(int((vt + dur) * sr / hop), n_frames))
+                                    if f1 > f0:
+                                        chroma[chroma_bin, f0:f1] += 1.0
+
+                            vt += dur
+
+            t_cur += bar_dur
+
+    return chroma
+
+_GP345_TICKS_PER_QUARTER = 960
+
+
+def _gp345_tempo_events(song) -> list[tuple[int, float]]:
+    """Sorted, tick-deduplicated ``[(tick, bpm)]`` tempo events for a GP3/4/5 song.
+
+    Seeds with the song's initial tempo at tick 0, then appends every
+    ``mixTableChange`` tempo. Shared by chroma synthesis and bar-time
+    computation so both use one identical tempo model (mirrors
+    ``gp2rs._build_tempo_map``).
+    """
+    events: list[tuple[int, float]] = [(0, float(song.tempo))]
+    for track in song.tracks:
+        for measure in track.measures:
+            for voice in measure.voices:
+                for beat in voice.beats:
+                    if beat.effect and beat.effect.mixTableChange:
+                        mtc = beat.effect.mixTableChange
+                        if mtc.tempo and mtc.tempo.value > 0:
+                            events.append((beat.start, float(mtc.tempo.value)))
+    events.sort(key=lambda e: e[0])
+    seen_ticks: set[int] = set()
+    unique: list[tuple[int, float]] = []
+    for tick, bpm in events:
+        if tick not in seen_ticks:
+            seen_ticks.add(tick)
+            unique.append((tick, bpm))
+    return unique
+
+
+def _gp345_tick_to_secs(tempo_events: list[tuple[int, float]], tick: int) -> float:
+    """Convert an absolute tick to seconds via per-segment tempo integration."""
+    secs = 0.0
+    prev_tick = 0
+    prev_bpm = tempo_events[0][1]
+    for ev_tick, ev_bpm in tempo_events:
+        if ev_tick >= tick:
+            break
+        secs += (ev_tick - prev_tick) / _GP345_TICKS_PER_QUARTER * (60.0 / prev_bpm)
+        prev_tick = ev_tick
+        prev_bpm = ev_bpm
+    secs += (tick - prev_tick) / _GP345_TICKS_PER_QUARTER * (60.0 / prev_bpm)
+    return secs
+
+
+def _synthesise_score_chroma_gp345(
+    gp_path: str,
+    n_frames: int,
+    sr: int,
+    hop: int,
+    _song=None,
+) -> 'np.ndarray':
+    """
+    Build a (12, n_frames) chroma matrix from a GP3/GP4/GP5 file.
+
+    Mirrors _synthesise_score_chroma() but reads note data via PyGuitarPro
+    instead of parsing GPIF XML, since GP3-5 files use a proprietary binary
+    format rather than the GPIF XML used by GP6-8.
+
+    Uses the same tick-to-seconds conversion as gp2rs._tick_to_seconds() so
+    timing is consistent with the RS XML that convert_file() produces.
+    """
+    import numpy as np
+    import guitarpro
+
+    song = _song if _song is not None else guitarpro.parse(gp_path)
+
+    tempo_events = _gp345_tempo_events(song)
+
+    def tick_to_secs(tick: int) -> float:
+        return _gp345_tick_to_secs(tempo_events, tick)
+
+    def duration_to_secs(duration, tempo_bpm: float) -> float:
+        beats = 4.0 / duration.value
+        if duration.isDotted:
+            beats *= 1.5
+        if duration.tuplet.enters > 0 and duration.tuplet.times > 0:
+            beats *= duration.tuplet.times / duration.tuplet.enters
+        return beats * (60.0 / tempo_bpm)
+
+    def tempo_at_tick(tick: int) -> float:
+        result = tempo_events[0][1]
+        for ev_tick, ev_bpm in tempo_events:
+            if ev_tick > tick:
+                break
+            result = ev_bpm
+        return result
+
+    chroma = np.zeros((12, n_frames), dtype=np.float32)
+
+    for track in song.tracks:
+        # Skip drums and vocals
+        name_l = (track.name or '').lower()
+        if any(kw in name_l for kw in _SKIP_TRACK_KEYWORDS):
+            continue
+        if track.isPercussionTrack:
+            continue
+
+        n_str = len(track.strings)
+        if n_str == 0:
+            continue
+
+        for _, measure in zip(song.measureHeaders, track.measures, strict=False):
+            for voice in measure.voices:
+                for beat in voice.beats:
+                    if not beat.notes:
+                        continue
+                    beat_secs = tick_to_secs(beat.start)
+                    cur_tempo = tempo_at_tick(beat.start)
+                    dur_secs = duration_to_secs(beat.duration, cur_tempo)
+
+                    for note in beat.notes:
+                        if note.type == guitarpro.NoteType.rest:
+                            continue
+                        if note.type == guitarpro.NoteType.tie:
+                            continue
+
+                        # GP string is 1-based (1 = highest string)
+                        gp_str = note.string  # 1-based
+                        if 1 <= gp_str <= n_str:
+                            # track.strings is 0-based; string 1 = index 0 = highest
+                            base_midi = track.strings[gp_str - 1].value
+                            midi = base_midi + note.value
+                            chroma_bin = midi % 12
+                            f0 = max(0, min(int(beat_secs * sr / hop), n_frames - 1))
+                            f1 = max(0, min(int((beat_secs + dur_secs) * sr / hop), n_frames))
+                            if f1 > f0:
+                                chroma[chroma_bin, f0:f1] += 1.0
+
+    return chroma
+
+def _safe_normalise(chroma: 'np.ndarray', eps: float = 1e-8) -> 'np.ndarray':
+    """L2-normalise columns; fill zero-energy columns with uniform distribution.
+
+    Zero-energy columns (rests, silent sections) would produce NaN under
+    cosine distance. Filling them with 1/12 makes them equidistant from all
+    chroma bins — they contribute nothing to the alignment cost.
+    """
+    import numpy as np
+    norms = np.linalg.norm(chroma, axis=0, keepdims=True)
+    zero_cols = (norms < eps).squeeze()
+    result = chroma / np.maximum(norms, eps)
+    result[:, zero_cols] = 1.0 / 12.0
+    return result
+
+# ── DTW alignment ─────────────────────────────────────────────────────────────
+
+def _dtw_align(
+    chroma_score: 'np.ndarray',
+    chroma_audio: 'np.ndarray',
+    sr: int,
+    hop: int,
+) -> 'np.ndarray':
+    """Run DTW and return a (N, 2) warping path in forward order.
+
+    librosa.sequence.dtw returns the path in reverse order (end→start);
+    we reverse it so index 0 = [score_frame=0, audio_frame=0].
+
+    Returns wp where wp[i] = [score_frame_index, audio_frame_index].
+    """
+    import librosa
+    cs = _safe_normalise(chroma_score)
+    ca = _safe_normalise(chroma_audio)
+    _D, wp = librosa.sequence.dtw(cs, ca, metric='cosine')
+    return wp[::-1]  # reverse to forward order
+
+# ── Sync point extraction from DTW path ──────────────────────────────────────
+
+def _extract_sync_points(
+    wp: 'np.ndarray',
+    root: ET.Element,
+    audio_times: 'np.ndarray',
+    score_times: 'np.ndarray',
+    sr: int,
+    hop: int,
+    n_sync_points: int,
+    bar_starts_override: list[float] | None = None,
+) -> list[SyncPoint]:
+    """
+    Sample the DTW warping path at evenly-spaced bar boundaries.
+
+    For each sampled bar, finds the audio frame the DTW path maps it to,
+    and computes ModifiedTempo from the ratio of audio duration to score
+    duration between adjacent sync points — this captures tempo drift
+    between the recording and the tab's authored tempo.
+    """
+    import numpy as np
+
+    tempo_map = _get_tempo_map(root)
+    masterbars = _children(root, 'MasterBars')
+    n_bars = len(masterbars)
+
+    if n_bars == 0:
+        return []
+
+    # Sample bar indices evenly across the song. Always include bar 0 and the
+    # last bar. Guard the public n_sync_points against 0/negative — it's the
+    # divisor for the sampling stride, so an unvalidated value would otherwise
+    # raise ZeroDivisionError mid-alignment.
+    step = max(1, n_bars // max(1, n_sync_points))
+    sampled_bars = list(range(0, n_bars, step))
+    if (n_bars - 1) not in sampled_bars:
+        sampled_bars.append(n_bars - 1)
+
+    # Build bar-start times in score (seconds). Callers that synthesised the
+    # score chroma with a finer (e.g. per-tick) tempo model can pass
+    # `bar_starts_override` so these bar→score-time lookups match where the
+    # bars actually sit in the chroma timeline; otherwise integrate bar
+    # durations from the (bar-resolution) tempo map. Mismatched models bias
+    # the DTW path lookup when a file has mid-bar tempo changes.
+    if bar_starts_override is not None:
+        bar_starts_score = list(bar_starts_override)
+    else:
+        tempo_iter = iter(tempo_map)
+        next_tb, next_bpm = next(tempo_iter, (999999, tempo_map[0][1]))
+        ct = tempo_map[0][1]
+        t_cur = 0.0
+        bar_starts_score = []
+        for mb_idx, mb in enumerate(masterbars):
+            while mb_idx >= next_tb:
+                ct = next_bpm
+                next_tb, next_bpm = next(tempo_iter, (999999, ct))
+            bar_starts_score.append(t_cur)
+            ts = mb.findtext('Time', '4/4')
+            try:
+                n_b, d_b = [int(x) for x in ts.split('/')]
+            except ValueError:
+                n_b, d_b = 4, 4
+            t_cur += n_b * (4.0 / d_b) * (60.0 / ct)
+
+    # Map each sampled bar to its audio time via the DTW path
+    sync_points: list[SyncPoint] = []
+    prev_bar: int | None = None
+    prev_score_t: float | None = None
+    prev_audio_t: float | None = None
+
+    for bar_idx in sampled_bars:
+        if bar_idx >= len(bar_starts_score):
+            continue
+        score_t = bar_starts_score[bar_idx]
+        score_frame = min(int(score_t * sr / hop), len(score_times) - 1)
+
+        # Find audio frame(s) the DTW path maps this score frame to
+        matches = wp[wp[:, 0] == score_frame, 1]
+        if len(matches) == 0:
+            # No exact match — find nearest score frame in path
+            diffs = np.abs(wp[:, 0] - score_frame)
+            nearest_idx = int(np.argmin(diffs))
+            matches = wp[nearest_idx:nearest_idx + 1, 1]
+
+        audio_frame = int(np.median(matches))
+        audio_t = float(audio_times[min(audio_frame, len(audio_times) - 1)])
+
+        # Compute modified tempo for the PREVIOUS segment and assign it
+        # to the previous SyncPoint. modified_bpm represents the tempo of
+        # the segment from prev_bar→bar_idx so it belongs to prev_bar's entry.
+        if prev_bar is not None and prev_score_t is not None and prev_audio_t is not None:
+            score_seg = score_t - prev_score_t
+            audio_seg = audio_t - prev_audio_t
+            if audio_seg > 0.1 and sync_points:
+                orig_prev = _tempo_at_bar(tempo_map, prev_bar)
+                modified_bpm = orig_prev * (score_seg / audio_seg)
+                modified_bpm = max(20.0, min(300.0, modified_bpm))
+                # Assign to the previous SyncPoint (the one for prev_bar)
+                sync_points[-1] = SyncPoint(
+                    bar=sync_points[-1].bar,
+                    time_secs=sync_points[-1].time_secs,
+                    modified_tempo=modified_bpm,
+                    original_tempo=sync_points[-1].original_tempo,
+                )
+
+        orig_bpm = _tempo_at_bar(tempo_map, bar_idx)
+
+        sync_points.append(SyncPoint(
+            bar=bar_idx,
+            time_secs=audio_t,
+            modified_tempo=orig_bpm,  # placeholder; updated by next iteration
+            original_tempo=orig_bpm,
+        ))
+
+        prev_bar = bar_idx
+        prev_score_t = score_t
+        prev_audio_t = audio_t
+
+    # The trailing sync point has no following segment, so the loop above
+    # never replaced its placeholder modified_tempo (== original_tempo).
+    # Carry the last computed segment tempo forward — the best available
+    # estimate for the final bar — so callers don't read a stale authored
+    # tempo for songs that drift in the final segment.
+    if len(sync_points) >= 2:
+        sync_points[-1] = SyncPoint(
+            bar=sync_points[-1].bar,
+            time_secs=sync_points[-1].time_secs,
+            modified_tempo=sync_points[-2].modified_tempo,
+            original_tempo=sync_points[-1].original_tempo,
+        )
+
+    return sync_points
+
+def _tempo_at_bar(tempo_map: list[tuple[int, float]], bar: int) -> float:
+    """Return the authored BPM at the given bar from the tempo map."""
+    result = tempo_map[0][1]
+    for tb, bpm in tempo_map:
+        if tb <= bar:
+            result = bpm
+        else:
+            break
+    return result
+
+# ── Audio offset estimation ───────────────────────────────────────────────────
+
+def _estimate_audio_offset(
+    root: ET.Element,
+    audio_path: str,
+    sr: int = _SR,
+    hop: int = _HOP_DTW,
+) -> float:
+    """
+    Estimate the audio_offset (seconds) for a GP file aligned to an audio file.
+
+    The offset is negative when audio starts before bar 1 (e.g. an intro that
+    isn't in the tab), positive when the tab starts before the audio.
+
+    This is a lightweight version of auto_sync — it only aligns the first
+    minute of audio to keep it fast for the UX preview.
+    """
+    import librosa
+    import numpy as np
+
+    # Load just the first 60 seconds of audio for speed
+    y, _ = librosa.load(audio_path, sr=sr, mono=True, duration=60.0)
+    chroma_audio = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop)
+    n_frames = chroma_audio.shape[1]
+
+    chroma_score = _synthesise_score_chroma(root, n_frames, sr, hop)
+    wp = _dtw_align(chroma_score, chroma_audio, sr, hop)
+
+    audio_times = librosa.times_like(chroma_audio, sr=sr, hop_length=hop)
+
+    # The audio time at score frame 0 IS the audio_offset
+    # (negative = audio starts before score bar 1)
+    matches = wp[wp[:, 0] == 0, 1]
+    if len(matches) == 0:
+        return 0.0
+
+    audio_frame_at_bar0 = int(np.median(matches))
+    audio_t_at_bar0 = float(audio_times[min(audio_frame_at_bar0, len(audio_times) - 1)])
+
+    # audio_offset is negative of the audio time at bar 0
+    # (bar 0 of the score is at audio_t_at_bar0 seconds into the file)
+    return -audio_t_at_bar0
+
+# ── Main public API ───────────────────────────────────────────────────────────
+
+def _refine_bar1_phase(
+    audio_path: str,
+    coarse_t: float,
+    tempo_bpm: float,
+    sr: int = _SR,
+    hop: int = 512,
+    search_radius: float = 3.0,
+    phase_step: float = 0.005,
+    onset_tolerance: float = 0.06,
+    analysis_duration: float = 120.0,
+    y: 'np.ndarray | None' = None,
+) -> float:
+    """
+    Refine a coarse bar-1 estimate using a tempo-phase sweep over onsets.
+
+    The DTW alignment gives a coarse estimate of where bar 1 falls in the
+    audio (±1-2s). This function narrows it to ±10ms by finding the beat
+    grid phase that maximises onset alignment within the search window.
+
+    Algorithm:
+    1. Detect onsets in the first `analysis_duration` seconds of audio
+    2. For each candidate phase within [coarse_t - search_radius,
+       coarse_t + search_radius], generate a click grid at `tempo_bpm`
+    3. Count how many onsets fall within `onset_tolerance` seconds of any
+       click — this is the alignment score
+    4. The phase with the highest score is bar 1 beat 1
+
+    This handles the common case of a silent or very soft first beat (e.g.
+    November Rain's piano attack at t=0) that onset detectors miss. The
+    phase sweep is immune to silent beats because it scores based on ALL
+    onsets across the song, not just the first.
+
+    Args:
+        audio_path:        Path to audio file
+        coarse_t:          DTW coarse estimate of bar-1 position (seconds)
+        tempo_bpm:         Tab's authored BPM at bar 1
+        sr:                Sample rate for analysis (default 22050)
+        hop:               Hop length for onset detection (default 512 = 23ms)
+        search_radius:     ±seconds around coarse_t to search (default 3.0)
+        phase_step:        Phase grid resolution in seconds (default 0.005 = 5ms)
+        onset_tolerance:   Max seconds an onset can be from a click to count
+                           as aligned (default 0.06 = 60ms)
+        analysis_duration: Seconds of audio to load for onset detection.
+                           Longer = more onsets = more reliable score.
+                           120s (first 2 min) covers enough material.
+        y:                 Optional pre-decoded mono audio at `sr` (e.g. the
+                           buffer auto_sync already loaded). When given, the
+                           on-disk reload is skipped and the buffer is sliced
+                           to the first `analysis_duration`s.
+
+    Returns:
+        Refined bar-1 time in seconds from the beginning of the audio file.
+        Returns coarse_t unchanged if onset detection yields fewer than 8
+        onsets (too sparse to score reliably).
+    """
+    import librosa
+    import numpy as np
+
+    beat_period = 60.0 / tempo_bpm
+    window_start = max(0.0, coarse_t - search_radius)
+    window_end = coarse_t + search_radius
+
+    # Reuse caller-provided audio (already decoded at `sr`) when available,
+    # else load the first `analysis_duration`s from disk. Either way only the
+    # first `analysis_duration`s are analysed, so slice a passed-in buffer.
+    if y is None:
+        y, _ = librosa.load(audio_path, sr=sr, mono=True, duration=analysis_duration)
+    else:
+        y = y[:int(analysis_duration * sr)]
+    onset_frames = librosa.onset.onset_detect(
+        y=y, sr=sr, hop_length=hop, backtrack=True
+    )
+    onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop)
+
+    if len(onset_times) < 8:
+        _log.warning(
+            "gp_autosync: only %d onsets detected — phase sweep unreliable, "
+            "using coarse DTW estimate %.3fs", len(onset_times), coarse_t,
+        )
+        return coarse_t
+
+    # Phase sweep
+    best_phase = coarse_t
+    best_score = -1
+    song_end = float(onset_times[-1]) + beat_period
+
+    for phase in np.arange(window_start, window_end, phase_step):
+        clicks = np.arange(phase, song_end, beat_period)
+        if clicks.size == 0:
+            # Phase is at/after the last detected onset (e.g. bar 1 estimated
+            # beyond the analysis window) — no grid to score against. Skip so
+            # np.min() never reduces an empty array; best_phase stays at the
+            # coarse DTW estimate if every phase is empty.
+            continue
+        score = int(sum(
+            1 for t in onset_times
+            if float(np.min(np.abs(clicks - t))) < onset_tolerance
+        ))
+        if score > best_score:
+            best_score = score
+            best_phase = float(phase)
+
+    _log.info(
+        "gp_autosync: phase sweep → bar-1 at %.3fs (score=%d onsets, "
+        "coarse was %.3fs, delta=%.3fs)",
+        best_phase, best_score, coarse_t, best_phase - coarse_t,
+    )
+    return best_phase
+
+def auto_sync(
+    gp_path: str,
+    audio_path: str,
+    n_sync_points: int = _MIN_SYNC_POINTS,
+    sr: int = _SR,
+    hop: int = _HOP_DTW,
+    progress_cb=None,
+    max_duration: float | None = None,
+) -> GpSyncData:
+    """
+    Automatically align a Guitar Pro file to an audio recording.
+
+    Uses chroma-based Dynamic Time Warping to find the optimal mapping
+    between the tab's note sequence and the audio's pitch content.
+
+    Args:
+        gp_path:       Path to .gpx or .gp file
+        audio_path:    Path to audio file (MP3, OGG, WAV, FLAC, etc.)
+        n_sync_points: Approximate *minimum* number of sync points to sample
+                       from the DTW path. Bars are sampled at a fixed stride
+                       (n_bars // n_sync_points) and bar 0 + the final bar are
+                       always included, so the count produced is typically a
+                       few more than requested. More = better accuracy across
+                       tempo changes; default suits most songs, use 16-32 for
+                       significant tempo drift.
+        sr:            Sample rate for chroma analysis (default 22050 Hz)
+        hop:           Hop length for chroma frames. Larger = faster but
+                       coarser. Default 4096 (~186ms/frame at 22050 Hz).
+        progress_cb:   Optional callable(stage: str, pct: int) for UI updates.
+        max_duration:  Optional cap (seconds) on how much audio to decode.
+                       None (default) loads the whole file — a ~9-min song is
+                       ~24 MB at 22050 Hz mono. Set this to clamp pathological
+                       inputs (e.g. hour-long concert recordings) at the cost
+                       of only aligning within the decoded window.
+
+    Returns:
+        GpSyncData with audio_offset, audio_asset_id='', and sync_points.
+
+    Raises:
+        ImportError: if librosa is not installed
+        ValueError:  if the files cannot be parsed
+    """
+    try:
+        import librosa
+        import numpy as np
+    except ImportError as e:
+        raise ImportError(
+            "auto_sync requires librosa. Install it with: "
+            "pip install librosa  (or install the lyrics-karaoke plugin)"
+        ) from e
+
+    def _progress(stage: str, pct: int) -> None:
+        if progress_cb is not None:
+            try:
+                progress_cb(stage, pct)
+            except Exception as e:
+                _log.debug("progress_cb raised: %s", e)
+        _log.debug("auto_sync: %s (%d%%)", stage, pct)
+
+    _progress("Loading Guitar Pro file...", 5)
+    try:
+        root = _load_gpif(gp_path)
+    except _Gp345FileError as _e:
+        # GP3/GP4/GP5 — store the error sentinel so chroma synthesis
+        # knows to use the PyGuitarPro path instead
+        root = _e
+
+    _progress("Loading audio file...", 10)
+    y, _ = librosa.load(audio_path, sr=sr, mono=True, duration=max_duration)
+    song_duration = len(y) / sr
+    _log.info("auto_sync: audio %.1fs, gp=%s", song_duration, Path(gp_path).name)
+
+    _progress("Extracting audio chroma features...", 20)
+    chroma_audio = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop)
+    n_frames = chroma_audio.shape[1]
+    _log.info("auto_sync: audio chroma %s", chroma_audio.shape)
+
+    _progress("Synthesising score chroma from tab...", 40)
+    # Route GP3/4/5 through PyGuitarPro; GPX/GP7/GP8 through GPIF XML
+    if isinstance(root, _Gp345FileError):
+        import guitarpro as _gp_once
+        _gp345_cached = _gp_once.parse(gp_path)
+        chroma_score = _synthesise_score_chroma_gp345(gp_path, n_frames, sr, hop,
+                                                       _song=_gp345_cached)
+    else:
+        chroma_score = _synthesise_score_chroma(root, n_frames, sr, hop)
+    n_pitched = int((chroma_score.sum(axis=0) > 0).sum())
+    _log.info(
+        "auto_sync: score chroma %s, %d/%d pitched frames",
+        chroma_score.shape, n_pitched, n_frames,
+    )
+
+    if n_pitched < 10:
+        raise ValueError(
+            "Score has fewer than 10 pitched frames — cannot align. "
+            "Ensure the GP file has guitar, bass, or keys tracks with notes."
+        )
+
+    _progress("Running Dynamic Time Warping alignment...", 60)
+    audio_times = librosa.times_like(chroma_audio, sr=sr, hop_length=hop)
+    score_times = librosa.times_like(chroma_score, sr=sr, hop_length=hop)
+    wp = _dtw_align(chroma_score, chroma_audio, sr, hop)
+    _log.info("auto_sync: DTW path length %d", len(wp))
+
+    _progress("Extracting coarse sync points from alignment...", 80)
+    # For GP3/4/5 build a minimal tempo map from PyGuitarPro song object
+    if isinstance(root, _Gp345FileError):
+        _gp345x_song = _gp345_cached  # reuse already-parsed song
+        # Build a synthetic GPIF-like tempo map for _extract_sync_points
+        # by creating a minimal XML root with just the tempo automations
+        _fake_root = ET.Element('GPIF')
+        _fake_mt = ET.SubElement(_fake_root, 'MasterTrack')
+        _fake_autos = ET.SubElement(_fake_mt, 'Automations')
+        # Same tempo model the GP3/4/5 chroma synthesis used, so bar times
+        # below line up with the chroma timeline.
+        _tempo_events_gp345 = _gp345_tempo_events(_gp345x_song)
+        # Convert tick events to bar events using actual measure start ticks
+        _measure_starts = []  # cumulative tick at start of each bar
+        _cum = 0
+        for _mh2 in _gp345x_song.measureHeaders:
+            _measure_starts.append(_cum)
+            _ts = _mh2.timeSignature
+            _cum += int(_ts.numerator * (4.0 / _ts.denominator.value) * _GP345_TICKS_PER_QUARTER)
+
+        def _tick_to_bar(tick):
+            """Return 0-based bar index for a given tick position."""
+            import bisect
+            idx = bisect.bisect_right(_measure_starts, tick) - 1
+            return max(0, idx)
+
+        for _tick, _bpm in _tempo_events_gp345:
+            _bar = _tick_to_bar(_tick)
+            _auto_el = ET.SubElement(_fake_autos, 'Automation')
+            ET.SubElement(_auto_el, 'Type').text = 'Tempo'
+            ET.SubElement(_auto_el, 'Bar').text = str(_bar)
+            ET.SubElement(_auto_el, 'Value').text = str(_bpm)
+        # Add minimal MasterBars
+        _fake_mbs = ET.SubElement(_fake_root, 'MasterBars')
+        for _mh in _gp345x_song.measureHeaders:
+            _mb_el = ET.SubElement(_fake_mbs, 'MasterBar')
+            ET.SubElement(_mb_el, 'Time').text = f"{_mh.timeSignature.numerator}/{_mh.timeSignature.denominator.value}"
+        _sync_root = _fake_root
+        # Precise per-tick bar-start times (matching the chroma timeline) so
+        # _extract_sync_points doesn't re-derive them from the coarse,
+        # bar-resolution fake-GPIF tempo map — which would diverge on
+        # mid-bar tempo changes and bias the sync points.
+        _bar_starts_override = [
+            _gp345_tick_to_secs(_tempo_events_gp345, _ms) for _ms in _measure_starts
+        ]
+    else:
+        _sync_root = root
+        _bar_starts_override = None
+
+    sync_points_coarse = _extract_sync_points(
+        wp, _sync_root, audio_times, score_times, sr, hop, n_sync_points,
+        bar_starts_override=_bar_starts_override,
+    )
+
+    # Stage 2: refine bar-1 using tempo-phase sweep over onsets.
+    # DTW gives a coarse estimate (±1-2s); the phase sweep narrows it to ±10ms
+    # by finding the beat grid phase that maximises onset alignment.
+    _progress("Refining bar-1 position with onset phase sweep...", 88)
+    coarse_bar1 = sync_points_coarse[0].time_secs if sync_points_coarse else 0.0
+    if isinstance(root, _Gp345FileError):
+        bar1_tempo = float(_gp345_cached.tempo)
+    else:
+        bar1_tempo = sync_points_coarse[0].original_tempo if sync_points_coarse else _get_initial_tempo(root)
+
+    refined_bar1 = _refine_bar1_phase(
+        audio_path=audio_path,
+        coarse_t=coarse_bar1,
+        tempo_bpm=bar1_tempo,
+        sr=sr,  # honour the caller's analysis rate (defaults to _SR)
+        hop=512,  # finer hop than DTW for onset detection (~23ms at 22050Hz)
+        search_radius=3.0,
+        phase_step=0.005,  # 5ms resolution
+        onset_tolerance=0.06,
+        y=y,  # reuse the audio already decoded above — no second load
+    )
+
+    # Compute audio_offset from refined bar-1 position
+    # (negative = audio starts before tab bar 1)
+    audio_offset = -refined_bar1
+
+    # Adjust all sync points by the delta between coarse and refined bar-1.
+    # This preserves the relative DTW alignment across the song while anchoring
+    # bar 1 precisely.
+    bar1_delta = refined_bar1 - coarse_bar1  # how much bar-1 moved
+    sync_points = []
+    for sp in sync_points_coarse:
+        sync_points.append(SyncPoint(
+            bar=sp.bar,
+            time_secs=sp.time_secs + bar1_delta,  # shift all points by same delta
+            modified_tempo=sp.modified_tempo,
+            original_tempo=sp.original_tempo,
+        ))
+
+    _progress("Done.", 100)
+    _log.info(
+        "auto_sync: %d sync points, audio_offset=%.3fs",
+        len(sync_points), audio_offset,
+    )
+
+    return GpSyncData(
+        audio_offset=audio_offset,
+        audio_asset_id='',  # external audio, not embedded
+        sync_points=sync_points,
+    )
+
+def estimate_audio_offset(gp_path: str, audio_path: str) -> float:
+    """
+    Estimate the audio_offset for a GP file aligned to an audio file.
+
+    For GPX/GP7/GP8 files: fast path — analyses only the first 60 seconds.
+    For GP3/GP4/GP5 files: slow path — runs the full auto_sync() because
+    PyGuitarPro-based chroma synthesis requires the complete file parse.
+    Callers should be aware that GP3/4/5 may take 10-30s rather than 1-2s.
+
+    Returns seconds (negative = audio starts before bar 1).
+    """
+    try:
+        import librosa  # noqa: F401
+    except ImportError as e:
+        raise ImportError("estimate_audio_offset requires librosa") from e
+
+    try:
+        root = _load_gpif(gp_path)
+    except _Gp345FileError:
+        # GP3/4/5: run full auto_sync and return just the offset.
+        sync = auto_sync(gp_path, audio_path)
+        return sync.audio_offset
+    return _estimate_audio_offset(root, audio_path)
+
+if __name__ == '__main__':
+    import sys
+    import logging as _logging
+    _logging.basicConfig(level=_logging.INFO)
+    if len(sys.argv) < 3:
+        _log.error("Usage: python gp_autosync.py <file.gp[x]> <audio.mp3>")
+        sys.exit(1)
+
+    if not is_available():
+        _log.error("librosa not installed. pip install librosa")
+        sys.exit(1)
+
+    gp_path, audio_path = sys.argv[1], sys.argv[2]
+    _log.info("Auto-syncing %s to %s...", Path(gp_path).name, Path(audio_path).name)
+
+    def progress(stage, pct):
+        _log.info("  [%3d%%] %s", pct, stage)
+
+    sync = auto_sync(gp_path, audio_path, progress_cb=progress)
+    _log.info("Result:")
+    _log.info("  audio_offset: %.3fs", sync.audio_offset)
+    _log.info("  sync_points:  %d", len(sync.sync_points))
+    for sp in sync.sync_points:
+        _log.info(
+            "    bar=%-4d t=%.3fs  modified_bpm=%.1f  original_bpm=%.1f",
+            sp.bar, sp.time_secs, sp.modified_tempo, sp.original_tempo,
+        )

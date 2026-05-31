@@ -22,7 +22,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 
-from psarc import unpack_psarc, read_psarc_entries
+from psarc import unpack_psarc
 from safepath import safe_join
 from song import (
     anchor_to_wire,
@@ -40,11 +40,16 @@ from tunings import tuning_name
 import sloppak as sloppak_mod
 import drums as drums_mod
 import loosefolder as loosefolder_mod
+# Metadata extraction lives in a side-effect-free module so ProcessPool
+# scan workers can import + unpickle _scan_one without re-running this
+# module's import-time side effects (see lib/scan_worker.py).
+from scan_worker import _extract_meta_for_file, _relpath, _scan_one
 
 import concurrent.futures
 import contextvars
 import inspect
 import ipaddress
+import multiprocessing
 import re
 import sqlite3
 import threading
@@ -1275,152 +1280,6 @@ def _get_dlc_dir(cfg: dict | None = None) -> Path | None:
 
 # ── Background metadata scan ──────────────────────────────────────────────────
 
-def _extract_meta_fast(psarc_path: Path) -> dict:
-    """Extract metadata from a PSARC using in-memory reading (no disk I/O)."""
-    files = read_psarc_entries(str(psarc_path), ["*.json", "*.xml", "*vocals*.sng"])
-
-    title = artist = album = year = ""
-    duration = 0.0
-    tuning = "E Standard"
-    # Track the offsets for the tuning we ultimately keep so we can
-    # compute tuning_sort_key (#22) without re-deriving it from the
-    # name. Defaults to E Standard offsets.
-    tuning_offsets: list[int] = [0] * 6
-    _tuning_from_guitar = False
-    arrangements = []
-    has_lyrics = False
-    arr_index = 0
-
-    # Parse manifest JSONs for metadata + arrangement info
-    for path, data in sorted(files.items()):
-        if not path.lower().endswith(".json"):
-            continue
-        try:
-            jdata = json.loads(data)
-            entries = jdata.get("Entries") or {}
-            for k, v in entries.items():
-                attrs = v.get("Attributes") or {}
-                arr_name = attrs.get("ArrangementName", "")
-                if arr_name in ("Vocals", "ShowLights", "JVocals"):
-                    continue
-                if not title:
-                    title = attrs.get("SongName", "")
-                    artist = attrs.get("ArtistName", "")
-                    album = attrs.get("AlbumName", "")
-                    yr = attrs.get("SongYear")
-                    year = str(yr) if yr else ""
-                    sl = attrs.get("SongLength")
-                    if sl:
-                        try: duration = float(sl)
-                        except (ValueError, TypeError): pass
-                if arr_name:
-                    # Get tuning - prefer guitar arrangements over bass
-                    tun = attrs.get("Tuning")
-                    if tun and isinstance(tun, dict):
-                        offsets = [tun.get(f"string{i}", 0) for i in range(6)]
-                        tun_name = tuning_name(offsets)
-                        is_guitar = arr_name in ("Lead", "Rhythm", "Combo")
-                        if tuning == "E Standard" or (is_guitar and not _tuning_from_guitar):
-                            tuning = tun_name
-                            tuning_offsets = offsets
-                            if is_guitar:
-                                _tuning_from_guitar = True
-                    notes = attrs.get("NotesHard", 0) or attrs.get("NotesMedium", 0) or 0
-                    # Read path flags for smart naming — stored temporarily with
-                    # underscore prefix and removed after smart names are computed.
-                    props = attrs.get("ArrangementProperties") or {}
-                    def _pi(key: str) -> int:
-                        try: return int(props.get(key, 0) or 0)
-                        except (TypeError, ValueError): return 0
-                    arrangements.append({
-                        "index": arr_index, "name": arr_name, "notes": notes,
-                        "_path_lead": bool(_pi("pathLead")),
-                        "_path_rhythm": bool(_pi("pathRhythm")),
-                        "_path_bass": bool(_pi("pathBass")),
-                        "_bonus_arr": bool(_pi("bonusArr")),
-                        "_represent": _pi("represent"),
-                    })
-                    arr_index += 1
-        except Exception:
-            continue
-
-    # Check XMLs for vocals (CDLC), or fall back to vocals SNG (official DLC)
-    for path, data in files.items():
-        if path.lower().endswith(".xml"):
-            try:
-                root = ET.fromstring(data)
-                if root.tag == "vocals":
-                    has_lyrics = True
-                    break
-            except Exception:
-                continue
-        elif path.lower().endswith(".sng") and "vocals" in path.lower():
-            has_lyrics = True
-            break
-
-    # Sort arrangements: Lead > Combo > Rhythm > Bass
-    priority = {"Lead": 0, "Combo": 1, "Rhythm": 2, "Bass": 3}
-    arrangements.sort(key=lambda a: priority.get(a["name"], 99))
-    for i, a in enumerate(arrangements):
-        a["index"] = i
-
-    # Compute smart names using the path flags read from the manifest.
-    # Build minimal Arrangement objects, then discard the temp flag fields.
-    from song import Arrangement as _ArrCls
-    _arr_objs = [
-        _ArrCls(
-            name=a["name"],
-            path_lead=a.pop("_path_lead", False),
-            path_rhythm=a.pop("_path_rhythm", False),
-            path_bass=a.pop("_path_bass", False),
-            bonus_arr=a.pop("_bonus_arr", False),
-            represent=a.pop("_represent", 0),
-        )
-        for a in arrangements
-    ]
-    _smart = compute_smart_names(_arr_objs)
-    for a, sn in zip(arrangements, _smart):
-        a["smart_name"] = sn
-
-    return {
-        "title": title, "artist": artist, "album": album, "year": year,
-        "duration": duration, "tuning": tuning,
-        "arrangements": arrangements, "has_lyrics": has_lyrics,
-        # PSARCs have no stems; emit an empty list so the column round-
-        # trips uniformly with sloppaks (slopsmith#129).
-        "stem_ids": [],
-        # Cached tuning fields (slopsmith#22 / #69). The text `tuning`
-        # column above stays the source of truth for display; these are
-        # the indexable / filterable forms.
-        "tuning_name": tuning,
-        "tuning_sort_key": sum(tuning_offsets),
-    }
-
-
-def _extract_meta_sloppak(path: Path) -> dict:
-    """Extract metadata for a sloppak (file or directory)."""
-    meta = sloppak_mod.extract_meta(path)
-    offsets = meta.pop("tuning_offsets", None) or [0] * 6
-    name = tuning_name(offsets)
-    meta["tuning"] = name
-    meta["tuning_name"] = name
-    meta["tuning_sort_key"] = sum(offsets)
-    meta["format"] = "sloppak"
-    # `extract_meta` already populates `stem_ids` (slopsmith#129);
-    # default to empty for older callers / mocks.
-    meta.setdefault("stem_ids", [])
-    # Compute smart names for sloppak arrangements using name-based fallback
-    # (sloppak manifests use display names like "Lead"/"Rhythm"/"Bass" directly).
-    arrs = meta.get("arrangements") or []
-    if arrs:
-        from song import Arrangement as _ArrCls
-        _arr_objs = [_ArrCls(name=a.get("name", "")) for a in arrs]
-        _smart = compute_smart_names(_arr_objs)
-        for a, sn in zip(arrs, _smart):
-            a["smart_name"] = sn
-    return meta
-
-
 def _resolve_dlc_path(dlc: Path, filename: str) -> Path | None:
     """Resolve `filename` under DLC_DIR and refuse anything that escapes.
 
@@ -1582,85 +1441,6 @@ def _stat_for_cache(f: Path) -> tuple[float, int]:
     return st.st_mtime, st.st_size
 
 
-def _extract_meta_loosefolder(path: Path) -> dict:
-    """Extract metadata for a loose song folder (raw XMLs + WEM audio)."""
-    # Pass DLC_DIR so artist/album folder inference operates on the
-    # dlc-relative path; otherwise absolute-path parts (e.g. the user's
-    # home dir name) would leak into metadata for songs placed shallow
-    # inside DLC_DIR.
-    meta = loosefolder_mod.extract_meta(path, dlc_root=_get_dlc_dir())
-    offsets = meta.pop("tuning_offsets", None) or [0] * 6
-    name = tuning_name(offsets)
-    meta["tuning"] = name
-    meta["tuning_name"] = name
-    meta["tuning_sort_key"] = sum(offsets)
-    meta["format"] = "loose"
-    meta.setdefault("stem_ids", [])
-    # The library helper exposes absolute filesystem paths for audio/art
-    # so callers inside the server can resolve them. Strip these before
-    # the meta enters the API/DB cache — `/api/song/{filename}` returns
-    # the dict directly on a cache miss, which would otherwise leak
-    # `/home/<user>/...` paths to the frontend.
-    meta.pop("audio_path", None)
-    meta.pop("art_path", None)
-    return meta
-
-
-def _extract_meta_for_file(psarc_path: Path) -> dict:
-    """Extract metadata — dispatches on extension; PSARC path tries fast then falls back."""
-    # Sloppak is detected by `.sloppak` suffix only (cheap), so check it
-    # first — that way a user's loose folder named `foo.sloppak` still wins
-    # the sloppak branch instead of being misclassified.
-    if sloppak_mod.is_sloppak(psarc_path):
-        return _extract_meta_sloppak(psarc_path)
-    if loosefolder_mod.is_loose_song(psarc_path):
-        return _extract_meta_loosefolder(psarc_path)
-    try:
-        meta = _extract_meta_fast(psarc_path)
-        if meta["title"]:
-            return meta
-    except Exception:
-        pass
-    # Fallback: full extraction (handles SNG-only official DLC etc.)
-    tmp = tempfile.mkdtemp(prefix="rs_scan_")
-    try:
-        unpack_psarc(str(psarc_path), tmp)
-        song = load_song(tmp)
-        tuning = "E Standard"
-        tuning_offsets: list[int] = [0] * 6
-        if song.arrangements and song.arrangements[0].tuning:
-            tuning_offsets = list(song.arrangements[0].tuning)
-            tuning = tuning_name(tuning_offsets)
-        _fb_smart = compute_smart_names(song.arrangements)
-        arrangements = [
-            {
-                "index": i, "name": a.name,
-                "notes": len(a.notes) + sum(len(c.notes) for c in a.chords),
-                "smart_name": _fb_smart[i],
-            }
-            for i, a in enumerate(song.arrangements)
-        ]
-        has_lyrics = False
-        for xf in Path(tmp).rglob("*.xml"):
-            try:
-                if ET.parse(str(xf)).getroot().tag == "vocals":
-                    has_lyrics = True
-                    break
-            except Exception:
-                pass
-        return {
-            "title": song.title, "artist": song.artist,
-            "album": song.album, "year": str(song.year) if song.year else "",
-            "duration": song.song_length, "tuning": tuning,
-            "arrangements": arrangements, "has_lyrics": has_lyrics,
-            "stem_ids": [],
-            "tuning_name": tuning,
-            "tuning_sort_key": sum(tuning_offsets),
-        }
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-
-
 _SCAN_STATUS_INIT = {"running": False, "stage": "idle", "total": 0, "done": 0, "current": "", "error": None, "is_first_scan": False}
 _scan_status = dict(_SCAN_STATUS_INIT)
 
@@ -1733,8 +1513,43 @@ def _get_startup_status():
         return dict(_startup_status)
 
 
+def _make_scan_executor():
+    """Build the executor for the background metadata scan.
+
+    A `spawn` ProcessPoolExecutor in production. `spawn` (not the platform
+    default) is mandatory: _background_scan runs on a non-main daemon
+    thread, and forking a multithreaded process from a non-main thread can
+    deadlock on locks held by other threads at fork time (the default on
+    Linux). `spawn` boots a clean interpreter that imports only scan_worker
+    (+ its pure lib deps) to unpickle the worker — never this module — so
+    workers don't re-run server.py's import-time side effects (reopening
+    SQLite, attaching a second RotatingFileHandler, re-registering routes).
+
+    Tests monkeypatch this to a ThreadPoolExecutor so the scan runs
+    in-process and metadata extraction can be mocked.
+    """
+    mp_ctx = multiprocessing.get_context("spawn")
+    # Default to one worker per core so CPU-bound AES decryption uses the
+    # whole machine (the point of moving to processes); `SCAN_MAX_WORKERS`
+    # overrides for constrained hosts. A malformed override falls back to
+    # the core count rather than crashing the scan thread.
+    try:
+        max_workers = int(os.environ.get("SCAN_MAX_WORKERS") or (os.cpu_count() or 1))
+    except ValueError:
+        max_workers = os.cpu_count() or 1
+    # ProcessPoolExecutor raises ValueError on Windows when max_workers > 61
+    # (the WaitForMultipleObjects handle limit), so clamp there — otherwise
+    # a high-core Windows host can't construct the pool and the scan never
+    # starts.
+    if sys.platform == "win32":
+        max_workers = min(max_workers, 61)
+    return concurrent.futures.ProcessPoolExecutor(
+        max_workers=max(1, max_workers), mp_context=mp_ctx,
+    )
+
+
 def _background_scan():
-    """Scan all PSARCs and cache metadata on startup. Uses thread pool for parallelism.
+    """Scan all PSARCs and cache metadata on startup. Uses process pool to bypass the GIL for CPU-bound AES decryption.
 
     Never sets `_scan_status["running"] = False` — ownership of that flag
     lives in `_scan_runner` so a `_kick_scan()` racing this function's
@@ -1816,17 +1631,7 @@ def _background_scan():
     log.info("Scan: listed %d PSARCs, %d sloppaks and %d loose folders in %s",
              len(psarcs), len(sloppaks), len(loose_songs), dlc)
 
-    def _rel(f: Path) -> str:
-        # Store the path relative to the DLC root so sub-folders (e.g.
-        # dlc/sloppak/foo.sloppak produced by the converter) resolve back
-        # correctly later. PSARCs always live directly in dlc/, so this
-        # reduces to f.name for them.
-        try:
-            return f.relative_to(dlc).as_posix()
-        except ValueError:
-            return f.name
-
-    current_files = {_rel(f) for f in all_songs}
+    current_files = {_relpath(f, dlc) for f in all_songs}
 
     # Clean up stale DB entries
     stale = meta_db.delete_missing(current_files)
@@ -1845,7 +1650,7 @@ def _background_scan():
         except OSError as e:
             log.debug("scan: skipping %s (%s)", f, e)
             continue
-        cache_key = _rel(f)
+        cache_key = _relpath(f, dlc)
         try:
             cached = meta_db.get(cache_key, mtime, size)
         except Exception as e:
@@ -1854,7 +1659,7 @@ def _background_scan():
             log.warning("scan cache lookup failed for %s: %s", cache_key, e)
             cached = None
         if not cached:
-            to_scan.append((f, mtime, size))
+            to_scan.append((f, mtime, size, dlc))
         elif cached.get("arrangements") and any(
             "smart_name" not in a for a in cached["arrangements"]
         ):
@@ -1866,7 +1671,7 @@ def _background_scan():
             # the arrangement (e.g. a name outside the recognised set with
             # zero path flags), so rescanning would produce the same null
             # forever and never converge.
-            to_scan.append((f, mtime, size))
+            to_scan.append((f, mtime, size, dlc))
 
     if not to_scan:
         _scan_status = {**_SCAN_STATUS_INIT, "running": True, "stage": "complete"}
@@ -1881,15 +1686,7 @@ def _background_scan():
     log.info("Library: %d PSARCs + %d sloppaks + %d loose folders, %d cached, %d to scan",
              len(psarcs), len(sloppaks), len(loose_songs), len(all_songs) - len(to_scan), len(to_scan))
 
-    def _scan_one(item):
-        f, mtime, size = item
-        # Per-file log so users running the server / desktop can see live
-        # activity and distinguish a stuck scan from a slow one.
-        log.debug("scanning %s", f.name)
-        meta = _extract_meta_for_file(f)
-        return _rel(f), mtime, size, meta
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+    with _make_scan_executor() as executor:
         futures = {executor.submit(_scan_one, item): item[0].name for item in to_scan}
         for future in concurrent.futures.as_completed(futures):
             fname = futures[future]
@@ -2051,7 +1848,11 @@ async def startup_events():
     plugin_context = {
         "config_dir": CONFIG_DIR,
         "get_dlc_dir": _get_dlc_dir,
-        "extract_meta": _extract_meta_for_file,
+        # Pass the DLC-root resolver (not its result) so loose-folder
+        # metadata keeps its dlc-relative artist/album inference while the
+        # lookup stays lazy — PSARC/sloppak extraction never reads config.
+        # Plugins still call this with just a path.
+        "extract_meta": lambda p: _extract_meta_for_file(p, _get_dlc_dir),
         "meta_db": meta_db,
         "get_scan_status": lambda: dict(_scan_status),
         "get_art_cache_dir": lambda: ART_CACHE_DIR,
@@ -4198,7 +3999,7 @@ async def ws_retune(websocket: WebSocket, filename: str, target: str = "E Standa
             new_path = Path(result)
             if new_path.exists():
                 try:
-                    meta = _extract_meta_for_file(new_path)
+                    meta = _extract_meta_for_file(new_path, dlc)
                     stat = new_path.stat()
                     meta_db.put(new_path.name, stat.st_mtime, stat.st_size, meta)
                 except Exception:
@@ -4426,7 +4227,7 @@ async def get_song_info(filename: str):
 
     # Extract in thread pool
     def _extract():
-        meta = _extract_meta_for_file(psarc_path)
+        meta = _extract_meta_for_file(psarc_path, dlc)
         meta_db.put(cache_key, mtime, size, meta)
         return meta
 

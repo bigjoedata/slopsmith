@@ -428,11 +428,24 @@ def test_psarc_platform_null_is_noop(client, tmp_path):
 
 @pytest.fixture()
 def scan_module(tmp_path, monkeypatch, isolate_logging):
-    """Import server with CONFIG_DIR and DLC_DIR isolated in tmp_path."""
+    """Import server with CONFIG_DIR and DLC_DIR isolated in tmp_path.
+
+    The background scan uses a `spawn` ProcessPoolExecutor in production
+    (see server._make_scan_executor), whose workers run in fresh
+    interpreters that an in-process mock.patch() can't reach. Override it
+    with an in-process ThreadPoolExecutor so these tests can mock metadata
+    extraction (on scan_worker, where the worker resolves it) and observe
+    the resulting DB state.
+    """
+    import concurrent.futures
     monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
     monkeypatch.delenv("DLC_DIR", raising=False)
     sys.modules.pop("server", None)
     mod = importlib.import_module("server")
+    monkeypatch.setattr(
+        mod, "_make_scan_executor",
+        lambda: concurrent.futures.ThreadPoolExecutor(max_workers=4),
+    )
     yield mod
     conn = getattr(getattr(mod, "meta_db", None), "conn", None)
     if conn is not None:
@@ -460,8 +473,8 @@ def test_scan_platform_both_includes_all(tmp_path, scan_module):
     }))
 
     import unittest.mock as mock
-    with mock.patch.object(scan_module, "_extract_meta_for_file",
-                           new=lambda f: {"title": f.name, "artist": "", "album": ""}):
+    with mock.patch("scan_worker._extract_meta_for_file",
+                    new=lambda f, dlc: {"title": f.name, "artist": "", "album": ""}):
         scan_module._background_scan()
 
     # Both files should appear in the DB
@@ -481,8 +494,8 @@ def test_scan_platform_pc_excludes_mac_files(tmp_path, scan_module):
     }))
 
     import unittest.mock as mock
-    with mock.patch.object(scan_module, "_extract_meta_for_file",
-                           new=lambda f: {"title": f.name, "artist": "", "album": ""}):
+    with mock.patch("scan_worker._extract_meta_for_file",
+                    new=lambda f, dlc: {"title": f.name, "artist": "", "album": ""}):
         scan_module._background_scan()
 
     all_keys = {r[0] for r in scan_module.meta_db.conn.execute("SELECT filename FROM songs").fetchall()}
@@ -501,8 +514,8 @@ def test_scan_platform_mac_excludes_pc_files(tmp_path, scan_module):
     }))
 
     import unittest.mock as mock
-    with mock.patch.object(scan_module, "_extract_meta_for_file",
-                           new=lambda f: {"title": f.name, "artist": "", "album": ""}):
+    with mock.patch("scan_worker._extract_meta_for_file",
+                    new=lambda f, dlc: {"title": f.name, "artist": "", "album": ""}):
         scan_module._background_scan()
 
     all_keys = {r[0] for r in scan_module.meta_db.conn.execute("SELECT filename FROM songs").fetchall()}
@@ -523,13 +536,13 @@ def test_is_first_scan_true_when_all_songs_unscanned(tmp_path, scan_module):
 
     import unittest.mock as mock
 
-    def mock_extract(f):
+    def mock_extract(f, dlc):
         # Capture the scan status on the first call (during the scanning phase)
         if not captured_status:
             captured_status.update(scan_module._scan_status)
         return {"title": f.name, "artist": "", "album": ""}
 
-    with mock.patch.object(scan_module, "_extract_meta_for_file", new=mock_extract):
+    with mock.patch("scan_worker._extract_meta_for_file", new=mock_extract):
         scan_module._background_scan()
 
     assert captured_status.get("is_first_scan") is True
@@ -553,12 +566,12 @@ def test_is_first_scan_false_when_some_songs_cached(tmp_path, scan_module):
 
     import unittest.mock as mock
 
-    def mock_extract(f):
+    def mock_extract(f, dlc):
         if not captured_status:
             captured_status.update(scan_module._scan_status)
         return {"title": f.name, "artist": "", "album": ""}
 
-    with mock.patch.object(scan_module, "_extract_meta_for_file", new=mock_extract):
+    with mock.patch("scan_worker._extract_meta_for_file", new=mock_extract):
         scan_module._background_scan()
 
     assert captured_status.get("is_first_scan") is False
